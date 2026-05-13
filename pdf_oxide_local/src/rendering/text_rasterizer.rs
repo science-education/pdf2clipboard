@@ -10,7 +10,7 @@
 //! - Uses system fonts as fallback when embedded fonts aren't available
 //! - Renders text using rustybuzz for shaping and tiny-skia for drawing glyph paths
 
-use super::create_fill_paint;
+use super::{create_fill_paint, create_stroke_paint};
 use crate::content::operators::TextElement;
 use crate::content::GraphicsState;
 use crate::document::PdfDocument;
@@ -543,12 +543,9 @@ impl TextRasterizer {
         let unicode_text = self.decode_text_to_unicode(text, font_info.as_deref());
         log::debug!("Decoded text: '{}' (font={:?})", unicode_text, gs.font_name);
 
-        // Create paint from fill color
-        let mut paint = create_fill_paint(gs, "Normal");
-        // Text rendering mode 3 = invisible text (used for searchable OCR layers)
-        if gs.render_mode == 3 {
-            paint.set_color(tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, 0.0).unwrap());
-        }
+        // Build fill and optional stroke paint based on Tr (text rendering mode)
+        let (paint, stroke_info_owned) = build_text_paints(gs);
+        let stroke_info = stroke_info_owned.as_ref().map(|(p, s)| (p, s));
 
         // Find and load font - prioritize embedded font data
         let pdf_font_name = gs.font_name.as_deref().unwrap_or("Helvetica");
@@ -582,16 +579,14 @@ impl TextRasterizer {
                             embedded,
                             0,
                             &paint,
+                            stroke_info,
                             base_transform,
                             gs,
                             clip_mask,
                         );
                     }
 
-                    if has_unicode_cmap {
-                        log::debug!("Using embedded font data for '{}' (Unicode cmap)", info.base_font);
-                        Some((None, Arc::clone(embedded), 0, false))
-                    } else if info.cff_gid_map.is_some() {
+                    if info.cff_gid_map.is_some() {
                         // CFF font with byte→GID mapping — use direct rendering
                         log::debug!(
                             "Using embedded CFF font '{}' with direct GID mapping",
@@ -599,13 +594,18 @@ impl TextRasterizer {
                         );
                         Some((None, Arc::clone(embedded), 0, true))
                     } else if info.subtype == "Type0" && info.cid_to_gid_map.is_some() {
-                        // Type0 with explicit CIDToGIDMap (Identity or table) — direct GID rendering.
-                        // Accept any CID font type; CIDFontType0 (CFF) that parsed as a face is usable.
+                        // Type0 with explicit CIDToGIDMap takes priority over Unicode-cmap shaping:
+                        // the CIDToGIDMap gives the authoritative CID→GID translation, and using
+                        // rustybuzz Unicode shaping on a different cmap can produce wrong GIDs when
+                        // the font's internal Unicode table diverges from the PDF's ToUnicode CMap.
                         log::debug!(
                             "Using embedded font '{}' with CIDToGIDMap (Type0, cid_font_type={:?})",
                             info.base_font, info.cid_font_type
                         );
                         Some((None, Arc::clone(embedded), 0, true))
+                    } else if has_unicode_cmap {
+                        log::debug!("Using embedded font data for '{}' (Unicode cmap)", info.base_font);
+                        Some((None, Arc::clone(embedded), 0, false))
                     } else {
                         // cmap unclassified (e.g. Windows Symbol only) or no explicit CIDToGIDMap.
                         // Try direct embedded rendering first; render_cid_direct falls back to
@@ -635,6 +635,7 @@ impl TextRasterizer {
                     &font_data,
                     index,
                     &paint,
+                    stroke_info,
                     base_transform,
                     gs,
                     clip_mask,
@@ -658,6 +659,7 @@ impl TextRasterizer {
                                 fallback_data,
                                 fallback_idx,
                                 &paint,
+                                stroke_info,
                                 base_transform,
                                 gs,
                                 clip_mask,
@@ -677,6 +679,7 @@ impl TextRasterizer {
                 font_data,
                 index,
                 &paint,
+                stroke_info,
                 base_transform,
                 gs,
                 clip_mask,
@@ -1067,6 +1070,7 @@ impl TextRasterizer {
         font_data: Arc<Vec<u8>>,
         index: u32,
         paint: &Paint,
+        stroke_info: Option<(&Paint, &tiny_skia::Stroke)>,
         base_transform: Transform,
         gs: &GraphicsState,
         clip_mask: Option<&tiny_skia::Mask>,
@@ -1114,6 +1118,7 @@ impl TextRasterizer {
                             fallback_data,
                             fallback_index,
                             paint,
+                            stroke_info,
                             base_transform,
                             gs,
                             clip_mask,
@@ -1295,10 +1300,13 @@ impl TextRasterizer {
                     pixmap.fill_path(
                         &path,
                         paint,
-                        tiny_skia::FillRule::Winding,
+                        tiny_skia::FillRule::EvenOdd,
                         glyph_transform,
                         clip_mask,
                     );
+                    if let Some((sp, stroke)) = stroke_info {
+                        pixmap.stroke_path(&path, sp, stroke, glyph_transform, clip_mask);
+                    }
                 }
                 // Vertical writing: replace horizontal advance with vertical advance
                 // when the font has a vmtx table. Falls back to horizontal if absent.
@@ -1329,14 +1337,42 @@ impl TextRasterizer {
                 }
                 last_fallback_cluster = Some(cluster);
 
-                // SEQUENTIAL FALLBACK: try Latin first (covers Latin, Greek,
-                // Cyrillic, common symbols), then CJK (covers CJK ideographs,
-                // kana, fullwidth forms, and many symbol blocks).
-                //
-                // Unlike the previous exclusive CJK/non-CJK branch, this
-                // sequential approach ensures that a character missing from
-                // the Latin fallback still gets a chance via the CJK font,
-                // and vice versa.  MuPDF uses a similar multi-stage strategy.
+                // SEQUENTIAL FALLBACK:
+                // Stage 0 – re-query the embedded font itself via direct Unicode
+                //           cmap lookup (glyph_index). rustybuzz sometimes returns
+                //           GID=0 (.notdef) when the shaping pipeline doesn't find
+                //           a cluster match, even though the font's own cmap has the
+                //           glyph under the Unicode codepoint. MuPDF always attempts
+                //           a direct cmap lookup before falling back to system fonts.
+                // Stage 1 – Latin / general system font
+                // Stage 2 – CJK system font
+
+                // Stage 0: direct cmap lookup in the primary (embedded) font
+                if let Some(direct_gid) = ttf_face_ref.glyph_index(char_at_pos) {
+                    let mut pb0 = PathBuilder::new();
+                    let mut b0 = SkiaOutlineBuilder(&mut pb0);
+                    if ttf_face_ref.outline_glyph(direct_gid, &mut b0).is_some() {
+                        if let Some(path0) = pb0.finish() {
+                            let t0 = combined_base
+                                .pre_translate(
+                                    (x_cursor + x_offset) * h_scale,
+                                    y_offset + gs.text_rise,
+                                )
+                                .pre_scale(scale, scale);
+                            pixmap.fill_path(
+                                &path0,
+                                paint,
+                                tiny_skia::FillRule::EvenOdd,
+                                t0,
+                                clip_mask,
+                            );
+                            if let Some((sp, stroke)) = stroke_info {
+                                pixmap.stroke_path(&path0, sp, stroke, t0, clip_mask);
+                            }
+                            has_outline = true;
+                        }
+                    }
+                }
 
                 // Stage 1: Latin / general fallback
                 if let Some((lat_id, lat_arc, lat_idx)) =
@@ -1362,18 +1398,18 @@ impl TextRasterizer {
                                     pixmap.fill_path(
                                         &lat_path,
                                         paint,
-                                        tiny_skia::FillRule::Winding,
+                                        tiny_skia::FillRule::EvenOdd,
                                         lat_transform,
                                         clip_mask,
                                     );
-                                    has_outline = true;
-                                    if let Some(adv) =
-                                        lat_cached.ttf_face.glyph_hor_advance(lat_gid)
-                                    {
-                                        x_advance_override = Some(
-                                            adv as f32 / lat_cached.units_per_em * font_size,
+                                    if let Some((sp, stroke)) = stroke_info {
+                                        pixmap.stroke_path(
+                                            &lat_path, sp, stroke, lat_transform, clip_mask,
                                         );
                                     }
+                                    has_outline = true;
+                                    // Do NOT override x_advance with fallback font metrics:
+                                    // PDF-declared advance is preserved (MuPDF behaviour).
                                 }
                             }
                         }
@@ -1407,28 +1443,36 @@ impl TextRasterizer {
                                         pixmap.fill_path(
                                             &cjk_path,
                                             paint,
-                                            tiny_skia::FillRule::Winding,
+                                            tiny_skia::FillRule::EvenOdd,
                                             cjk_transform,
                                             clip_mask,
                                         );
+                                        if let Some((sp, stroke)) = stroke_info {
+                                            pixmap.stroke_path(
+                                                &cjk_path, sp, stroke, cjk_transform, clip_mask,
+                                            );
+                                        }
                                         has_outline = true;
 
-                                        let adv_src = if wmode == 1 {
-                                            cjk_cached
+                                        // Vertical writing: use fallback font's vertical advance
+                                        // (PDF /W2 metrics are rarely declared; horizontal
+                                        // advance from /W is unreliable for vertical layout).
+                                        // Horizontal writing: keep PDF-declared advance (MuPDF).
+                                        if wmode == 1 {
+                                            let adv_src = cjk_cached
                                                 .ttf_face
                                                 .glyph_ver_advance(cjk_glyph_id)
                                                 .or_else(|| {
                                                     cjk_cached
                                                         .ttf_face
                                                         .glyph_hor_advance(cjk_glyph_id)
-                                                })
-                                        } else {
-                                            cjk_cached.ttf_face.glyph_hor_advance(cjk_glyph_id)
-                                        };
-                                        if let Some(adv) = adv_src {
-                                            x_advance_override = Some(
-                                                adv as f32 / cjk_cached.units_per_em * font_size,
-                                            );
+                                                });
+                                            if let Some(adv) = adv_src {
+                                                x_advance_override = Some(
+                                                    adv as f32 / cjk_cached.units_per_em
+                                                        * font_size,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1473,6 +1517,7 @@ impl TextRasterizer {
         font_data: &[u8],
         index: u32,
         paint: &Paint,
+        stroke_info: Option<(&Paint, &tiny_skia::Stroke)>,
         base_transform: Transform,
         gs: &GraphicsState,
         clip_mask: Option<&tiny_skia::Mask>,
@@ -1525,13 +1570,14 @@ impl TextRasterizer {
             let pdf_width = font_info.get_glyph_width(cid);
             let x_advance = pdf_width * font_size / 1000.0;
 
-            // Get Unicode character for space/word-space detection.
-            // Use '\0' as the sentinel for "no mapping" so that bytes without a
-            // Unicode entry (e.g. ligatures and accented chars in symbolic TrueType
-            // fonts that use the Mac Roman cmap path) are not silently treated as
-            // spaces and dropped from the rendered output.
+            // Determine the Unicode character for this code unit.
+            // Priority: ToUnicode CMap → treat CID as Unicode codepoint (valid
+            // heuristic for Identity-H CJK fonts where CIDs equal Unicode values).
+            // '\0' means "unknown" and suppresses system-font fallback.
             let char_str = font_info.char_to_unicode(cid as u32).unwrap_or_default();
-            let char_at_pos = char_str.chars().next().unwrap_or('\0');
+            let char_at_pos = char_str.chars().next()
+                .or_else(|| char::from_u32(cid as u32).filter(|c| !c.is_control()))
+                .unwrap_or('\0');
 
             // Draw glyph outline
             let mut rendered = false;
@@ -1550,10 +1596,13 @@ impl TextRasterizer {
                             pixmap.fill_path(
                                 &path,
                                 paint,
-                                tiny_skia::FillRule::Winding,
+                                tiny_skia::FillRule::EvenOdd,
                                 glyph_transform,
                                 clip_mask,
                             );
+                            if let Some((sp, stroke)) = stroke_info {
+                                pixmap.stroke_path(&path, sp, stroke, glyph_transform, clip_mask);
+                            }
                             rendered = true;
                         }
                     }
@@ -1585,10 +1634,15 @@ impl TextRasterizer {
                                         pixmap.fill_path(
                                             &lat_path,
                                             paint,
-                                            tiny_skia::FillRule::Winding,
+                                            tiny_skia::FillRule::EvenOdd,
                                             glyph_transform,
                                             clip_mask,
                                         );
+                                        if let Some((sp, stroke)) = stroke_info {
+                                            pixmap.stroke_path(
+                                                &lat_path, sp, stroke, glyph_transform, clip_mask,
+                                            );
+                                        }
                                         rendered = true;
                                     }
                                 }
@@ -1624,10 +1678,19 @@ impl TextRasterizer {
                                             pixmap.fill_path(
                                                 &cjk_path,
                                                 paint,
-                                                tiny_skia::FillRule::Winding,
+                                                tiny_skia::FillRule::EvenOdd,
                                                 glyph_transform,
                                                 clip_mask,
                                             );
+                                            if let Some((sp, stroke)) = stroke_info {
+                                                pixmap.stroke_path(
+                                                    &cjk_path,
+                                                    sp,
+                                                    stroke,
+                                                    glyph_transform,
+                                                    clip_mask,
+                                                );
+                                            }
                                             rendered = true;
                                         }
                                     }
@@ -1699,7 +1762,7 @@ impl TextRasterizer {
                         pixmap.fill_path(
                             &path,
                             paint,
-                            tiny_skia::FillRule::Winding,
+                            tiny_skia::FillRule::EvenOdd,
                             transform,
                             clip_mask,
                         );
@@ -1843,6 +1906,49 @@ fn fallback_char_to_unicode(char_code: u32) -> String {
             } else {
                 "\u{FFFD}".to_string()
             }
+        },
+    }
+}
+
+/// Build fill and optional stroke paints for a text rendering mode (Tr).
+///
+/// PDF spec §9.3.6 defines 8 rendering modes:
+///   0 – fill (default)
+///   1 – stroke only
+///   2 – fill then stroke
+///   3 – invisible
+///   4–7 – clip variants (clip path building is handled elsewhere; these
+///          functions only determine the paint to use for rasterised output)
+fn build_text_paints(
+    gs: &GraphicsState,
+) -> (tiny_skia::Paint<'static>, Option<(tiny_skia::Paint<'static>, tiny_skia::Stroke)>) {
+    let stroke = tiny_skia::Stroke {
+        width: gs.line_width.max(0.5),
+        line_cap: tiny_skia::LineCap::Round,
+        line_join: tiny_skia::LineJoin::Round,
+        miter_limit: gs.miter_limit,
+        dash: None,
+    };
+    match gs.render_mode {
+        1 => {
+            // Stroke only: fill is transparent
+            let mut fill = create_fill_paint(gs, "Normal");
+            fill.set_color(tiny_skia::Color::TRANSPARENT);
+            (fill, Some((create_stroke_paint(gs, "Normal"), stroke)))
+        },
+        2 => {
+            // Fill then stroke
+            (create_fill_paint(gs, "Normal"), Some((create_stroke_paint(gs, "Normal"), stroke)))
+        },
+        3 => {
+            // Invisible (e.g. searchable OCR layer)
+            let mut fill = create_fill_paint(gs, "Normal");
+            fill.set_color(tiny_skia::Color::TRANSPARENT);
+            (fill, None)
+        },
+        _ => {
+            // Mode 0 (fill) and clip-only modes 4–7 — fill only
+            (create_fill_paint(gs, "Normal"), None)
         },
     }
 }

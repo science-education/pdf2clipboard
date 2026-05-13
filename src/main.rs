@@ -3,10 +3,7 @@
 use eframe::egui::{self, ColorImage, ScrollArea, TextureHandle, TextureOptions};
 use pdf_oxide::{
     document::PdfDocument,
-    rendering::{
-        list_installed_font_families, render_page, render_page_fit, set_preferred_cjk_font,
-        set_preferred_latin_font, RenderOptions,
-    },
+    rendering::{render_page, render_page_fit, RenderOptions},
 };
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -36,57 +33,10 @@ struct App {
     page_aspect:     f32,
     dpi:             f32,
     n_threads:       usize,
-    cjk_font:        String,
-    latin_font:      String,
-    installed_fonts: Vec<String>,
     status:          String,
     tx:              mpsc::Sender<(usize, ColorImage)>,
     rx:              Arc<Mutex<mpsc::Receiver<(usize, ColorImage)>>>,
     render_gen:      Arc<AtomicU32>,
-}
-
-fn settings_path() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    let dir = std::path::Path::new(&appdata).join("PDFPageCopier");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("settings.json"))
-}
-
-fn json_get(json: &str, key: &str) -> String {
-    let needle = format!("\"{}\":\"", key);
-    let start = match json.find(&needle) {
-        Some(i) => i + needle.len(),
-        None => return String::new(),
-    };
-    let rest = &json[start..];
-    let end = rest.find('"').unwrap_or(rest.len());
-    rest[..end].to_string()
-}
-
-fn json_esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-// Returns (cjk_font, latin_font)
-fn load_font_settings() -> (String, String) {
-    let path = match settings_path() {
-        Some(p) => p,
-        None => return (String::new(), String::new()),
-    };
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    (json_get(&text, "cjk_font"), json_get(&text, "latin_font"))
-}
-
-fn save_font_settings(cjk: &str, latin: &str) {
-    let Some(path) = settings_path() else { return; };
-    let _ = std::fs::write(
-        path,
-        format!(
-            "{{\"cjk_font\":\"{}\",\"latin_font\":\"{}\"}}",
-            json_esc(cjk),
-            json_esc(latin)
-        ),
-    );
 }
 
 fn build_doc(bytes: &[u8]) -> Result<PdfDocument, String> {
@@ -121,11 +71,6 @@ impl App {
         let n_threads = std::thread::available_parallelism()
             .map(|p| p.get().saturating_sub(1).max(1))
             .unwrap_or(1);
-        let (cjk_font, latin_font) = load_font_settings();
-        set_preferred_cjk_font(&cjk_font);
-        set_preferred_latin_font(&latin_font);
-        // Enumerate installed fonts once at startup (queries fontdb — takes ~10ms cold).
-        let installed_fonts = list_installed_font_families();
         Self {
             pdf_bytes: None,
             page_count: 0,
@@ -134,9 +79,6 @@ impl App {
             page_aspect: 0.707,
             dpi: 300.0,
             n_threads,
-            cjk_font,
-            latin_font,
-            installed_fonts,
             status: "Drop a PDF file onto this window".into(),
             tx,
             rx: Arc::new(Mutex::new(rx)),
@@ -442,63 +384,6 @@ impl eframe::App for App {
                 );
                 ui.add_space(16.0);
 
-                // --- CJK font selector ---
-                ui.label("CJK:");
-                let old_cjk = self.cjk_font.clone();
-                let cjk_label = if self.cjk_font.is_empty() {
-                    "自動".to_owned()
-                } else {
-                    self.cjk_font.clone()
-                };
-                egui::ComboBox::from_id_salt("cjk_font")
-                    .selected_text(cjk_label)
-                    .width(160.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.cjk_font, String::new(), "自動");
-                        for name in &self.installed_fonts {
-                            ui.selectable_value(&mut self.cjk_font, name.clone(), name.as_str());
-                        }
-                    });
-                if self.cjk_font != old_cjk {
-                    set_preferred_cjk_font(&self.cjk_font);
-                    save_font_settings(&self.cjk_font, &self.latin_font);
-                    if self.pdf_bytes.is_some() {
-                        for p in &mut self.pages { p.tex = None; }
-                        self.spawn_render(self.page_count, self.thumb_size);
-                    }
-                }
-
-                ui.add_space(8.0);
-
-                // --- Latin/general font selector ---
-                ui.label("英数:");
-                let old_latin = self.latin_font.clone();
-                let latin_label = if self.latin_font.is_empty() {
-                    "自動".to_owned()
-                } else {
-                    self.latin_font.clone()
-                };
-                egui::ComboBox::from_id_salt("latin_font")
-                    .selected_text(latin_label)
-                    .width(160.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.latin_font, String::new(), "自動");
-                        for name in &self.installed_fonts {
-                            ui.selectable_value(
-                                &mut self.latin_font,
-                                name.clone(),
-                                name.as_str(),
-                            );
-                        }
-                    });
-                if self.latin_font != old_latin {
-                    set_preferred_latin_font(&self.latin_font);
-                    save_font_settings(&self.cjk_font, &self.latin_font);
-                    if self.pdf_bytes.is_some() {
-                        for p in &mut self.pages { p.tex = None; }
-                        self.spawn_render(self.page_count, self.thumb_size);
-                    }
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
                 });

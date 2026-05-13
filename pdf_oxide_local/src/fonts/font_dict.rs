@@ -1091,6 +1091,34 @@ impl FontInfo {
         let descendant_embedded =
             Self::extract_embedded_font_from_descriptor(cidfont_dict, base_font, doc);
 
+        // For CIDFontType0 (CFF), build a CID→GID map from the CFF charset
+        // table. A CFF subset stores glyphs sequentially by GID (0..N) but
+        // CIDs are arbitrary — without this map, every PDF CID would be
+        // rendered as whatever glyph happens to sit at that index in the
+        // subset (e.g. digit "1" renders as "4"). The map overrides the
+        // earlier `None` so render_cid_direct picks up the correct GID.
+        let cid_to_gid_map = if cid_font_type == "CIDFontType0" && cid_to_gid_map.is_none() {
+            descendant_embedded
+                .as_ref()
+                .and_then(|data| super::cff_encoding::parse_cff_cid_to_gid(data))
+                .map(|cid_to_gid| {
+                    let max_cid = cid_to_gid.keys().copied().max().unwrap_or(0) as usize;
+                    let mut vec = vec![0u16; max_cid + 1];
+                    for (cid, gid) in &cid_to_gid {
+                        vec[*cid as usize] = *gid;
+                    }
+                    log::info!(
+                        "Font '{}': Built CFF CID→GID map ({} CIDs, max CID {})",
+                        base_font,
+                        cid_to_gid.len(),
+                        max_cid
+                    );
+                    CIDToGIDMap::Explicit(vec)
+                })
+        } else {
+            cid_to_gid_map
+        };
+
         Ok((
             cid_to_gid_map,
             cid_system_info,
@@ -1281,10 +1309,14 @@ fn wrap_cff_in_opentype(cff_data: &[u8]) -> Vec<u8> {
         0x01, 0x00, // numberOfHMetrics = 256
     ];
 
-    // Minimal maxp table (6 bytes for CFF fonts — version 0.5)
+    // Minimal maxp table (6 bytes for CFF fonts — version 0.5).
+    // numGlyphs is set to 0xFFFF so ttf-parser does not reject GIDs from large
+    // CJK CFF subsets (which routinely have GIDs above 256). The CFF table
+    // itself remains the authority on which glyphs actually exist; ttf-parser
+    // returns None from outline_glyph() for non-existent CIDs.
     let maxp_table: [u8; 6] = [
         0x00, 0x00, 0x50, 0x00, // version = 0.5 (CFF)
-        0x01, 0x00, // numGlyphs = 256
+        0xFF, 0xFF, // numGlyphs = 65535
     ];
 
     // Layout: offset table (12) + 4 table records (64) = 76 bytes header

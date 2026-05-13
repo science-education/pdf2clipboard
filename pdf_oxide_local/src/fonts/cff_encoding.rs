@@ -771,6 +771,111 @@ fn extract_cff_from_opentype(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// Build a CID→GID map from a CID-keyed CFF font (CIDFontType0).
+///
+/// In a CFF subset embedded in a PDF, glyphs are stored sequentially by GID
+/// (0..num_glyphs) while their CIDs are arbitrary — defined by the CFF
+/// `charset` table. Treating the PDF CID as the GID (Identity) returns the
+/// wrong glyph for every subset (e.g. digit "1" rendered as "4"). This
+/// function inverts the charset (which gives GID → CID) into CID → GID.
+///
+/// The caller must verify the font is CID-keyed (descendant `/Subtype` is
+/// `/CIDFontType0`); for non-CID CFF fonts the charset entries are SIDs into
+/// the String INDEX, not CIDs, and the result is meaningless.
+///
+/// Returns `None` if the data is not a recognisable CFF / OpenType-CFF font
+/// or uses a predefined charset (ISOAdobe / Expert / ExpertSubset), in which
+/// case the caller should fall back to Identity.
+pub fn parse_cff_cid_to_gid(font_data: &[u8]) -> Option<HashMap<u16, u16>> {
+    let cff_data: &[u8] = if font_data.first() == Some(&1) {
+        font_data
+    } else {
+        extract_cff_from_opentype(font_data)?
+    };
+    if cff_data.len() < 4 || cff_data[0] != 1 {
+        return None;
+    }
+    let hdr_size = cff_data[2] as usize;
+
+    let (_, after_name) = parse_index(cff_data, hdr_size)?;
+    let (top_dicts, after_top_dict) = parse_index(cff_data, after_name)?;
+    if top_dicts.is_empty() {
+        return None;
+    }
+    let (_, _after_string) = parse_index(cff_data, after_top_dict)?;
+
+    // Inline Top DICT scan: collect charset (op 15) and CharStrings (op 17) offsets.
+    let (charset_offset, charstrings_offset) = {
+        let dict_data = top_dicts[0];
+        let mut charset: i32 = 0;
+        let mut charstrings: i32 = 0;
+        let mut pos = 0;
+        let mut stack: Vec<i32> = Vec::new();
+        while pos < dict_data.len() {
+            let b0 = dict_data[pos];
+            if b0 <= 21 {
+                let op = if b0 == 12 {
+                    pos += 1;
+                    if pos >= dict_data.len() {
+                        break;
+                    }
+                    (12u16 << 8) | dict_data[pos] as u16
+                } else {
+                    b0 as u16
+                };
+                match op {
+                    15 => {
+                        if let Some(&v) = stack.last() {
+                            charset = v;
+                        }
+                    },
+                    17 => {
+                        if let Some(&v) = stack.last() {
+                            charstrings = v;
+                        }
+                    },
+                    _ => {},
+                }
+                stack.clear();
+                pos += 1;
+            } else if let Some((val, consumed)) = parse_dict_operand(dict_data, pos) {
+                stack.push(val);
+                pos += consumed;
+            } else {
+                pos += 1;
+            }
+        }
+        (charset, charstrings)
+    };
+
+    if charstrings_offset <= 0 {
+        return None;
+    }
+    let cs_off = charstrings_offset as usize;
+    if cs_off + 2 > cff_data.len() {
+        return None;
+    }
+    let num_glyphs = u16::from_be_bytes([cff_data[cs_off], cff_data[cs_off + 1]]) as usize;
+    if num_glyphs == 0 {
+        return None;
+    }
+
+    // Predefined charsets (ISOAdobe=0, Expert=1, ExpertSubset=2) are not used
+    // by CID-keyed PDF subsets — bail and let the caller use Identity.
+    if charset_offset < 3 {
+        return None;
+    }
+
+    let gid_to_cid = parse_charset(cff_data, charset_offset as usize, num_glyphs)?;
+
+    let mut map = HashMap::with_capacity(gid_to_cid.len());
+    for (gid, &cid) in gid_to_cid.iter().enumerate() {
+        // Keep the first GID seen for each CID (lowest GID wins on duplicates).
+        map.entry(cid).or_insert(gid as u16);
+    }
+    Some(map)
+}
+
 /// Extract the built-in encoding from a CFF font program.
 ///
 /// Returns a HashMap mapping character codes (u8) to Unicode characters.

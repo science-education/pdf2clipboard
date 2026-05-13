@@ -940,21 +940,24 @@ impl PageRenderer {
                     width,
                     height,
                 } => {
-                    // Normalize negative width/height per PDF spec:
-                    // re with negative dimensions means the rect extends in the opposite direction
-                    let (nx, nw) = if *width < 0.0 {
-                        (x + width, -width)
-                    } else {
-                        (*x, *width)
-                    };
-                    let (ny, nh) = if *height < 0.0 {
-                        (y + height, -height)
-                    } else {
-                        (*y, *height)
-                    };
-                    if let Some(rect) = tiny_skia::Rect::from_xywh(nx, ny, nw, nh) {
-                        current_path.push_rect(rect);
-                    }
+                    // PDF 1.7 §8.5.2.1: `x y w h re` expands to
+                    //   x y m
+                    //   (x+w) y l
+                    //   (x+w) (y+h) l
+                    //   x (y+h) l
+                    //   h
+                    // This expansion is winding-direction sensitive: when w or
+                    // h is negative the resulting subpath winds opposite to a
+                    // positive-dimension rectangle. Glyph-style PDFs rely on
+                    // this to carve holes via the non-zero winding rule
+                    // (`f`), so we must preserve the spec winding rather than
+                    // normalising to positive width/height + push_rect, which
+                    // always produces the same direction and fills the hole.
+                    current_path.move_to(*x, *y);
+                    current_path.line_to(*x + *width, *y);
+                    current_path.line_to(*x + *width, *y + *height);
+                    current_path.line_to(*x, *y + *height);
+                    current_path.close();
                 },
                 Operator::ClosePath => {
                     current_path.close();
