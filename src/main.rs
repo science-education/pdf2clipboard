@@ -6,9 +6,11 @@ use pdf_oxide::{
     rendering::{render_page, render_page_fit, RenderOptions},
 };
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    mpsc, Arc, Mutex,
+    atomic::AtomicU32,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc, Mutex};
 
 #[cfg(windows)]
 use windows::Win32::{
@@ -27,20 +29,26 @@ use wasm_bindgen::JsCast;
 // ---------------------------------------------------------------------------
 
 struct PageSlot {
-    tex: Option<TextureHandle>,
+    tex:         Option<TextureHandle>,
+    img:         Option<ColorImage>,
+    is_full_res: bool,
 }
 
 struct App {
     pdf_bytes:       Option<Arc<[u8]>>,
+    cached_doc:      Option<PdfDocument>,
+    copied_page:     Option<usize>,
     page_count:      u32,
     pages:           Vec<PageSlot>,
     thumb_size:      u32,
     page_aspect:     f32,
     dpi:             f32,
     n_threads:       usize,
+    cache_full_res:  bool,
     status:          String,
-    tx:              mpsc::Sender<(usize, ColorImage)>,
-    rx:              Arc<Mutex<mpsc::Receiver<(usize, ColorImage)>>>,
+    tx:              mpsc::Sender<(usize, ColorImage, bool)>,
+    rx:              Arc<Mutex<mpsc::Receiver<(usize, ColorImage, bool)>>>,
+    #[allow(dead_code)]
     render_gen:      Arc<AtomicU32>,
 }
 
@@ -63,7 +71,7 @@ fn setup_fonts(ctx: &egui::Context) {
             fonts.font_data.insert("jp".to_owned(), egui::FontData::from_owned(data));
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 if let Some(v) = fonts.families.get_mut(&family) {
-                    v.push("jp".to_owned());
+                    v.insert(0, "jp".to_owned());
                 }
             }
             break;
@@ -90,12 +98,15 @@ impl App {
             .unwrap_or(1);
         Self {
             pdf_bytes: None,
+            cached_doc: None,
+            copied_page: None,
             page_count: 0,
             pages: Vec::new(),
             thumb_size: 180,
             page_aspect: 0.707,
-            dpi: 300.0,
+            dpi: 180.0,
             n_threads,
+            cache_full_res: false,
             status: "Drop a PDF file onto this window".into(),
             tx,
             rx: Arc::new(Mutex::new(rx)),
@@ -129,72 +140,92 @@ impl App {
     }
 
     fn do_load(&mut self, bytes: Arc<[u8]>) -> Result<u32, String> {
-        let doc = build_doc(&bytes)?;
-        let n = doc.page_count().map_err(|e| e.to_string())? as u32;
+        // Move heavy analysis to a separate thread with a large stack for stability
+        let (tx_load, rx_load) = std::sync::mpsc::channel();
+        let bytes_for_thread = Arc::clone(&bytes);
+        
+        let _ = std::thread::Builder::new()
+            .name("pdf-loader".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let res = (|| -> Result<(u32, f32, PdfDocument), String> {
+                    let doc = build_doc(&bytes_for_thread)?;
+                    let n = doc.page_count().map_err(|e| e.to_string())? as u32;
 
-        // Scan all pages for average aspect ratio (metadata only, fast)
-        let mut total_aspect = 0.0f32;
-        let mut count = 0u32;
-        for i in 0..n as usize {
-            if let Ok(info) = doc.get_page_info(i) {
-                let (pw, ph) = if info.rotation == 90 || info.rotation == 270 {
-                    (info.media_box.height, info.media_box.width)
-                } else {
-                    (info.media_box.width, info.media_box.height)
-                };
-                if ph > 0.0 {
-                    total_aspect += pw / ph;
-                    count += 1;
-                }
+                    // Scan all pages for average aspect ratio
+                    let mut total_aspect = 0.0f32;
+                    let mut count = 0u32;
+                    for i in 0..n as usize {
+                        if let Ok(info) = doc.get_page_info(i) {
+                            let (pw, ph) = if info.rotation == 90 || info.rotation == 270 {
+                                (info.media_box.height, info.media_box.width)
+                            } else {
+                                (info.media_box.width, info.media_box.height)
+                            };
+                            if ph > 0.0 {
+                                total_aspect += pw / ph;
+                                count += 1;
+                            }
+                        }
+                    }
+                    let aspect = if count > 0 { total_aspect / count as f32 } else { 0.707 };
+                    Ok((n, aspect, doc))
+                })();
+                let _ = tx_load.send(res);
+            });
+
+        match rx_load.recv().unwrap_or(Err("Loader thread died".into())) {
+            Ok((n, aspect, doc)) => {
+                self.page_aspect = aspect;
+                self.page_count = n;
+                self.cached_doc = Some(doc);
+                self.copied_page = None;
+                self.pages = (0..n).map(|_| PageSlot { tex: None, img: None, is_full_res: false }).collect();
+                self.pdf_bytes = Some(bytes);
+                self.spawn_render(n, self.thumb_size);
+                Ok(n)
             }
+            Err(e) => Err(e),
         }
-        self.page_aspect = if count > 0 { total_aspect / count as f32 } else { 0.707 };
-
-        self.page_count = n;
-        self.pages = (0..n).map(|_| PageSlot { tex: None }).collect();
-        self.pdf_bytes = Some(bytes);
-        self.spawn_render(n, self.thumb_size);
-        Ok(n)
     }
 
-    fn spawn_render(&self, page_count: u32, thumb_size: u32) {
-        let bytes = match &self.pdf_bytes {
-            Some(b) => Arc::clone(b),
-            None => return,
-        };
-
-        let _gen        = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        let _render_gen = Arc::clone(&self.render_gen);
-        let _tx         = self.tx.clone();
-        let _next_page  = Arc::new(Mutex::new(0u32));
-        let _page_count = page_count;
-        let _thumb_size = thumb_size;
-        let _bytes      = Arc::clone(&bytes);
-
+    fn spawn_render(&self, _page_count: u32, _thumb_size: u32) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let gen = _gen;
-            let render_gen = _render_gen;
-            let tx = _tx;
-            let next_page = _next_page;
+            let bytes = match &self.pdf_bytes {
+                Some(b) => Arc::clone(b),
+                None => return,
+            };
             let page_count = _page_count;
-            let thumb_size = _thumb_size;
-            let bytes = _bytes;
-            for _ in 0..self.n_threads {
+
+            let gen         = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let render_gen  = Arc::clone(&self.render_gen);
+            let tx          = self.tx.clone();
+            let next_page      = Arc::new(Mutex::new(0u32));
+            let next_page_full = Arc::new(Mutex::new(0u32));
+
+            let cache_full = self.cache_full_res;
+            for _i in 0..self.n_threads {
                 let bytes     = Arc::clone(&bytes);
                 let tx        = tx.clone();
                 let next_page = Arc::clone(&next_page);
+                let next_page_full = Arc::clone(&next_page_full);
                 let rgen      = Arc::clone(&render_gen);
+                let dpi       = self.dpi;
 
-                std::thread::spawn(move || {
+                let builder = std::thread::Builder::new()
+                    .name(format!("render-{}", _i))
+                    .stack_size(16 * 1024 * 1024); // 16MB stack
+
+                let _ = builder.spawn(move || {
                 let doc = match build_doc(&bytes) {
                     Ok(d) => d,
                     Err(_) => return,
                 };
 
+                // Pass 1: Quick thumbnails (36 DPI) - updates UI
                 loop {
-                    if rgen.load(Ordering::Relaxed) != gen { break; }
-
+                    if rgen.load(Ordering::Relaxed) != gen { return; }
                     let i = {
                         let mut guard = next_page.lock().unwrap();
                         if *guard >= page_count { break; }
@@ -202,12 +233,28 @@ impl App {
                         *guard += 1;
                         i
                     };
-
-                    if let Ok(img) = pdf_render(&doc, i as usize, thumb_size as f32, None) {
-                        if tx.send((i as usize, img)).is_err() { break; }
+                    if let Ok(img) = pdf_render(&doc, i as usize, 0.0, Some(36.0)) {
+                        if tx.send((i as usize, img, false)).is_err() { return; }
                     }
                 }
-            });
+
+                // Pass 2: High-quality (dpi) - internal cache only (if enabled)
+                if cache_full {
+                    loop {
+                        if rgen.load(Ordering::Relaxed) != gen { return; }
+                        let i = {
+                            let mut guard = next_page_full.lock().unwrap();
+                            if *guard >= page_count { break; }
+                            let i = *guard;
+                            *guard += 1;
+                            i
+                        };
+                        if let Ok(img) = pdf_render(&doc, i as usize, 0.0, Some(dpi)) {
+                            if tx.send((i as usize, img, true)).is_err() { return; }
+                        }
+                    }
+                }
+                });
             }
         }
 
@@ -222,28 +269,69 @@ impl App {
     }
 
     fn copy_page(&mut self, page_num: usize) {
-        let bytes = match &self.pdf_bytes {
-            Some(b) => Arc::clone(b),
-            None => return,
-        };
-        let dpi = self.dpi;
-
-        match build_doc(&bytes) {
-            Ok(doc) => match pdf_render(&doc, page_num, 0.0, Some(dpi)) {
-                Ok(img) => {
+        // --- WASM: use cached thumbnail image (instant, no re-rendering) ---
+        #[cfg(target_arch = "wasm32")]
+        {
+            if page_num < self.pages.len() {
+                if let Some(ref img) = self.pages[page_num].img {
                     let w = img.size[0];
                     let h = img.size[1];
-                    #[cfg(windows)]
-                    clipboard_set_windows(&img);
-                    
-                    #[cfg(target_arch = "wasm32")]
-                    clipboard_set_web(&img);
-
-                    self.status = format!("Page {} copied  ({w}×{h} px @ {dpi} DPI)", page_num + 1);
+                    clipboard_set_web(img);
+                    let status_suffix = if self.pages[page_num].is_full_res { "" } else { " (low-res preview)" };
+                    self.status = format!("Page {} copied{status_suffix}  ({w}×{h} px)", page_num + 1);
+                    return;
                 }
-                Err(e) => self.status = format!("Error copying page {}: {e}", page_num + 1),
-            },
-            Err(e) => self.status = format!("Error: {e}"),
+            }
+            self.status = format!("Page {} not yet rendered", page_num + 1);
+            return;
+        }
+
+        // --- Native: use cached high-DPI image if ready, otherwise fallback ---
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if page_num < self.pages.len() {
+                if let Some(ref img) = self.pages[page_num].img {
+                    if self.pages[page_num].is_full_res {
+                        let w = img.size[0];
+                        let h = img.size[1];
+                        #[cfg(windows)]
+                        clipboard_set_windows(img);
+                        
+                        let dpi = self.dpi;
+                        self.status = format!("Page {} copied  ({w}×{h} px) (@ {dpi} DPI)", page_num + 1);
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: synchronous render with large stack if cache is missing
+                let dpi = self.dpi;
+                let bytes = match &self.pdf_bytes {
+                    Some(b) => Arc::clone(b),
+                    None => return,
+                };
+
+                let (tx_sync, rx_sync) = std::sync::mpsc::channel();
+                let _ = std::thread::Builder::new()
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let res = (|| {
+                            let doc = build_doc(&bytes)?;
+                            pdf_render(&doc, page_num, 0.0, Some(dpi))
+                        })();
+                        let _ = tx_sync.send(res);
+                    });
+
+                match rx_sync.recv().unwrap_or(Err("Thread died".into())) {
+                    Ok(img) => {
+                        let w = img.size[0];
+                        let h = img.size[1];
+                        #[cfg(windows)]
+                        clipboard_set_windows(&img);
+                        self.status = format!("Page {} copied  ({w}×{h} px @ {dpi} DPI)", page_num + 1);
+                    }
+                    Err(e) => self.status = format!("Error copying page {}: {e}", page_num + 1),
+                }
         }
     }
 }
@@ -272,6 +360,7 @@ fn pdf_render(
 
     // tiny-skia outputs premultiplied RGBA. Un-premultiply to straight RGBA for egui.
     // For scanned PDFs with white background alpha is always 255, so this is fast.
+    #[allow(unused_mut)]
     let mut pixels: Vec<egui::Color32> = rendered.data.chunks_exact(4)
         .map(|p| {
             let a = p[3];
@@ -291,38 +380,7 @@ fn pdf_render(
         })
         .collect();
 
-    if dpi.is_none() {
-        sharpen_rgba(&mut pixels, w, h);
-    }
-
     Ok(ColorImage { size: [w, h], pixels })
-}
-
-fn sharpen_rgba(pixels: &mut Vec<egui::Color32>, w: usize, h: usize) {
-    if w < 3 || h < 3 { return; }
-    let src = pixels.clone();
-    #[rustfmt::skip]
-    const K: [f32; 9] = [0.0, -0.5, 0.0, -0.5, 3.0, -0.5, 0.0, -0.5, 0.0];
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
-            for ky in 0..3usize {
-                for kx in 0..3usize {
-                    let k = K[ky * 3 + kx];
-                    if k == 0.0 { continue; }
-                    let px = src[(y + ky - 1) * w + (x + kx - 1)];
-                    r += px.r() as f32 * k;
-                    g += px.g() as f32 * k;
-                    b += px.b() as f32 * k;
-                }
-            }
-            pixels[y * w + x] = egui::Color32::from_rgb(
-                r.clamp(0.0, 255.0) as u8,
-                g.clamp(0.0, 255.0) as u8,
-                b.clamp(0.0, 255.0) as u8,
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,11 +443,50 @@ fn clipboard_set_windows(img: &ColorImage) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn clipboard_set_web(_img: &ColorImage) {
-    // For Web, copying images to clipboard is complex and requires navigator.clipboard.
-    // Usually it needs to be a Blob.
-    // For now, we just log a message.
-    log::info!("Image copy to clipboard is not yet implemented for Web.");
+fn clipboard_set_web(img: &ColorImage) {
+    let w = img.size[0] as u32;
+    let h = img.size[1] as u32;
+    let mut rgba_data = Vec::with_capacity((w * h * 4) as usize);
+    for px in &img.pixels {
+        rgba_data.push(px.r());
+        rgba_data.push(px.g());
+        rgba_data.push(px.b());
+        rgba_data.push(px.a());
+    }
+
+    let js_array = js_sys::Uint8Array::from(rgba_data.as_slice());
+
+    let func = js_sys::Function::new_with_args(
+        "w, h, arr",
+        r#"
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(w, h);
+            imgData.data.set(arr);
+            ctx.putImageData(imgData, 0, 0);
+
+            const blobPromise = new Promise((resolve, reject) => {
+                canvas.toBlob((blob) => {
+                    if (blob) resolve(blob);
+                    else reject(new Error("Canvas toBlob failed"));
+                }, 'image/png');
+            });
+
+            const item = new ClipboardItem({ 'image/png': blobPromise });
+            navigator.clipboard.write([item]).then(() => {
+                console.log("Image copied to clipboard successfully via Wasm!");
+            }).catch((err) => {
+                console.error("Clipboard write failed (check browser permissions or user activation timeout):", err);
+            });
+        } catch(e) {
+            console.error("Web clipboard copy exception:", e);
+        }
+        "#
+    );
+    let _ = func.call3(&wasm_bindgen::JsValue::NULL, &wasm_bindgen::JsValue::from(w), &wasm_bindgen::JsValue::from(h), &js_array);
 }
 
 // ---------------------------------------------------------------------------
@@ -418,17 +515,24 @@ impl eframe::App for App {
 
         {
             let rx = self.rx.lock().unwrap();
-            let mut n = 0;
-            while let Ok((i, img)) = rx.try_recv() {
+            let mut n_recv = 0;
+            while let Ok((i, img, is_full)) = rx.try_recv() {
                 if i < self.pages.len() {
-                    self.pages[i].tex = Some(
-                        ctx.load_texture(format!("p{i}"), img, TextureOptions::LINEAR)
-                    );
+                    // Only update texture if it's the low-res pass (is_full == false)
+                    // or if we somehow don't have a texture yet.
+                    if !is_full || self.pages[i].tex.is_none() {
+                        self.pages[i].tex = Some(
+                            ctx.load_texture(format!("p{i}"), img.clone(), TextureOptions::LINEAR)
+                        );
+                    }
+                    self.pages[i].img = Some(img);
+                    self.pages[i].is_full_res = is_full;
                 }
-                n += 1;
-                if n >= 4 { break; }
+                n_recv += 1;
+                if n_recv >= 4 { break; }
             }
         }
+        // Repaint if we still have pages that haven't even finished pass 1
         if self.page_count > 0 && self.pages.iter().any(|p| p.tex.is_none()) {
             ctx.request_repaint();
         }
@@ -438,6 +542,11 @@ impl eframe::App for App {
                 ui.label("DPI:");
                 ui.add(egui::DragValue::new(&mut self.dpi)
                     .range(72.0..=600.0f32).speed(1.0).suffix(" dpi"));
+                if ui.checkbox(&mut self.cache_full_res, "Pre-cache (High-res)").changed() {
+                    if self.cache_full_res && self.pdf_bytes.is_some() {
+                        self.spawn_render(self.page_count, self.thumb_size);
+                    }
+                }
                 ui.add_space(16.0);
                 ui.label("Thumbnail:");
                 let old = self.thumb_size;
@@ -501,11 +610,16 @@ impl eframe::App for App {
                                         let scale = (cell_w / iw as f32)
                                             .min(thumb_f / ih as f32);
                                         let disp = egui::vec2(iw as f32 * scale, ih as f32 * scale);
-                                        ui.add(
+                                        let resp = ui.add(
                                             egui::Image::new(
                                                 egui::load::SizedTexture::new(tex.id(), disp))
                                             .sense(egui::Sense::click())
-                                        )
+                                        );
+                                        if self.copied_page == Some(i) {
+                                            let rect = resp.rect.shrink(2.0);
+                                            ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(4.0, egui::Color32::RED));
+                                        }
+                                        resp
                                     } else {
                                         let (rect, resp) = ui.allocate_exact_size(
                                             egui::vec2(cell_w.min(thumb_f), thumb_f),
@@ -513,13 +627,22 @@ impl eframe::App for App {
                                         );
                                         ui.painter().rect_filled(
                                             rect, 4.0, egui::Color32::from_gray(50));
+                                        if self.copied_page == Some(i) {
+                                            let rect = rect.shrink(2.0);
+                                            ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(4.0, egui::Color32::RED));
+                                        }
                                         resp
                                     };
                                     if resp.clicked() { clicked = Some(i); }
                                     resp.on_hover_text(format!("Page {} — click to copy", i + 1));
+                                    let label_color = if self.pages[i].is_full_res {
+                                        egui::Color32::BLACK
+                                    } else {
+                                        egui::Color32::GRAY
+                                    };
                                     ui.label(
                                         egui::RichText::new(format!("p.{}", i + 1))
-                                            .color(egui::Color32::GRAY).size(11.0));
+                                            .color(label_color).size(11.0));
                                 },
                             );
                         }
@@ -528,6 +651,7 @@ impl eframe::App for App {
             });
 
             if let Some(i) = clicked {
+                self.copied_page = Some(i);
                 self.copy_page(i);
             }
         });
@@ -537,16 +661,13 @@ impl eframe::App for App {
 impl App {
     #[cfg(target_arch = "wasm32")]
     fn drive_render_wasm(&self, ctx: &egui::Context) {
-        // This is a simple single-threaded renderer for Wasm.
-        // It picks up the next page and renders it if the texture is missing.
         let page_count = self.page_count;
-        let thumb_size = self.thumb_size;
         let bytes = match &self.pdf_bytes {
             Some(b) => Arc::clone(b),
             None => return,
         };
 
-        // Find first page that needs rendering
+        // Pass 1: Find first page that has NO texture (render at 36 DPI)
         let mut target_idx = None;
         for i in 0..page_count as usize {
             if self.pages[i].tex.is_none() {
@@ -556,13 +677,31 @@ impl App {
         }
 
         if let Some(i) = target_idx {
-            let doc = match build_doc(&bytes) {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-            if let Ok(img) = pdf_render(&doc, i, thumb_size as f32, None) {
-                let _ = self.tx.send((i, img));
+            let doc = match build_doc(&bytes) { Ok(d) => d, Err(_) => return };
+            if let Ok(img) = pdf_render(&doc, i, 0.0, Some(36.0)) {
+                let _ = self.tx.send((i, img, false));
                 ctx.request_repaint();
+                return;
+            }
+        }
+
+        // Pass 2: Find first page that is not yet full res (internal cache update)
+        if self.cache_full_res {
+            let mut target_high = None;
+            for i in 0..page_count as usize {
+                if !self.pages[i].is_full_res {
+                    target_high = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(i) = target_high {
+                let doc = match build_doc(&bytes) { Ok(d) => d, Err(_) => return };
+                let dpi = self.dpi.min(150.0);
+                if let Ok(img) = pdf_render(&doc, i, 0.0, Some(dpi)) {
+                    let _ = self.tx.send((i, img, true));
+                    ctx.request_repaint();
+                }
             }
         }
     }

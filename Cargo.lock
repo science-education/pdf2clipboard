@@ -2094,6 +2094,7 @@ dependencies = [
  "eframe",
  "egui",
  "getrandom 0.2.17",
+ "js-sys",
  "log",
  "pdf_oxide",
  "poll-promise",
