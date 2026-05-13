@@ -1,60 +1,73 @@
-# PDFPageCopier
+# PDFPageCopier (Web & Desktop)
 
-PDFのページをサムネイル一覧で表示し、選択したページの画像をクリップボードにコピーするWindows向けデスクトップアプリです。
+PDFのページをサムネイル一覧で表示し、選択したページの画像をクリップボードにコピーするアプリケーションです。
+Windows向けネイティブデスクトップアプリとして動作するほか、WebAssembly (Wasm) を通じてモダンなWebブラウザ上でも直接動作するクロスプラットフォーム構成となっています。
 
-## 機能
+## 主な機能
 
-- PDFをドラッグ＆ドロップまたはファイルダイアログで開く
-- 全ページをサムネイル形式で一覧表示
-- ページをクリックするとクリップボードに高解像度画像（BMP形式）をコピー
-- DPIとサムネイルサイズをスライダーで調整
-- マルチスレッドでページを並列レンダリング
+- **柔軟なファイル読み込み**: PDFファイルをドラッグ＆ドロップ、またはファイル選択ダイアログからシームレスに読み込み可能（Web/デスクトップ両対応）。
+- **高速・高精細プレビュー**: 全ページをサムネイル形式で滑らかに一覧表示。スライダーでDPI解像度およびサムネイル表示サイズを即座に調整可能。
+- **ワンクリック画像コピー**: 任意のサムネイルをクリックするだけで、レンダリングされた高品質なページ画像をシステムのクリップボードへ直接格納。
+- **高度な縦書きレンダリング対応**: 縦書きPDF（`WMode=1`）における文字基準原点の上端中央シフトおよび垂直文字送り軸（Y軸方向）に完全対応し、表セル等のマス目中央へ文字を正確に配置。
+- **堅牢な多段フォールバック**: 埋め込みフォントに該当する文字グリフが存在しない場合でも、文字コードから動的にラテンフォント（Stage 1）およびCJKフォント（Stage 2）へ順次切り替えて描画し、文字消失を強力に防止。
 
-## ビルド方法
+## 開発・ビルド方法
 
 ### 必要環境
-
 - Rust 1.75以上（[rustup](https://rustup.rs/) で導入）
-- Windows 10/11（Win32クリップボードAPIを使用）
+- WebAssemblyビルド用: `wasm32-unknown-unknown` ターゲットおよび [Trunk](https://trunkrs.dev/) ビルドツール
 
-### ビルド
+### 1. ネイティブデスクトップ版（Windows）の実行
+Win32クリップボードAPIおよびマルチスレッドによる高速並列レンダリングを活用します。
 
+```bash
+cargo run --release
 ```
-cargo build --release
+※ビルドされた実行ファイルは `target/release/PDFPageCopier.exe` に出力されます。
+
+### 2. Webアプリ版（WebAssembly）の実行
+ブラウザの `HtmlCanvasElement` および標準クリップボードAPIを利用し、安全なシングルスレッド環境で動作します。
+
+```bash
+# Trunkが未インストールの場合は事前に導入してください
+# cargo install trunk
+# rustup target add wasm32-unknown-unknown
+
+trunk serve
 ```
+ローカル開発サーバーが起動し、ブラウザ（デフォルトでは `http://127.0.0.1:8080`）上で即座に確認・テストが可能です。
 
-実行ファイルは `target/release/PDFPageCopier.exe` に生成されます。
+## レンダリングエンジンとフォント仕様
 
-## フォントレンダリング
+本アプリはローカルフォークされた高精度PDFレンダラー（`pdf_oxide`）を内包しており、ドキュメントに埋め込まれたフォントストリームを最優先で解析・描画します。
 
-PDFに埋め込まれたフォントを最優先で使用します。
+### 対応している埋め込みフォント形式
 
-対応している埋め込みフォント形式:
+| 形式 | PDF内ストリーム | 描画対応 | 備考 |
+|------|----------------|----------|------|
+| TrueType サブセット | FontFile2 | ✅ | |
+| CFF / OpenType-CFF | FontFile3 | ✅ | |
+| CIDFontType0 (CFF, Identity-H/V) | FontFile3 | ✅ | |
+| CIDFontType2 (TrueType, Identity-H/V) | FontFile2 | ✅ | |
+| Type 1 | FontFile | 代替対応 | 該当文字コードに基づきシステムフォントでフォールバック描画 |
 
-| 形式 | ストリーム | 対応 |
-|------|-----------|------|
-| TrueType サブセット | FontFile2 | ✅ |
-| CFF / OpenType-CFF | FontFile3 | ✅ |
-| CIDFontType0 (CFF, Identity-H/V) | FontFile3 | ✅ |
-| CIDFontType2 (TrueType, Identity-H/V) | FontFile2 | ✅ |
-| Type 1 | FontFile | システムフォントで代替 |
+### 実装上の高度な工夫点
 
-埋め込みフォントに該当グリフが無い場合は、システムフォント（CJK優先順、Latin優先順）へ自動フォールバックします。縦書きPDFは `-V` / `Vert` CMAPで検出し対応します。
+- **縦書き座標系（WMode=1）の適正化**: 一般的な横書き用フォントやCIDフォント展開において、縦書き指示が指定されている場合、文字の上端中央が描画原点となるよう自動オフセット補正（左へ0.5em、下へ0.88em）を適用。後続文字へのポインタ移動も垂直方向へと切り替えることで、官公庁等の複雑な縦書き表組レイアウトを忠実に再現します。
+- **CFF サブセットの CID→GID マップ**: CIDFontType0 (CFF) サブセットフォントでは、グリフは GID 順に格納される一方、CID は CFF の `charset` テーブルによって定義されます。PDF側の CID を直接 GID として渡すと誤った文字が描画されるため、内部で `charset` テーブルをパースして正確な対応表を動的構築しています。
+- **OpenType ラッパーの maxp.numGlyphs 拡張**: 生 CFF データを OpenType 形式にラップする際、ヘッダーの `maxp.numGlyphs` を `0xFFFF` に拡張設定しています。標準の256グリフ上限のままだと、数千文字に及ぶ日本語グリフが大半範囲外と判定されパーサーに拒否される問題を回避しています。
+- **`re` オペレータの巻数方向の保持**: PDF仕様（§8.5.2.1）に準拠し、`x y w h re` 命令を展開する際、幅・高さの正負によるパスの描画方向（時計回り/反時計回り）を維持したままサブパス化します。これにより非ゼロ巻数則（`f` オペレータ）が正しく適用され、ロゴ文字等の複雑な白抜き部分を正確にくり抜きます。
+- **Wasmターゲット向け並列処理の分離**: `#[cfg(target_arch = "wasm32")]` アトリビュートを適用し、ブラウザ環境で制約となる `rayon` 依存コードやファイルシステムアクセスを完全に切り離した単一スレッド用のクリーンなパイプラインを確立しています。
 
-### 実装上の注意点
+## 依存主要クレート
 
-- **CFF サブセットの CID→GID マップ**: CIDFontType0 (CFF) サブセットフォントでは、グリフは GID 順に格納されるが CID は CFF の `charset` テーブルが定義します。PDF の CID をそのまま GID として使うと別の glyph が描画されるため、`charset` テーブルから CID→GID 対応表を構築して使用します。
-- **OpenType ラッパーの maxp.numGlyphs**: 生 CFF データを OpenType ラッパーで包む際、`maxp.numGlyphs` は 0xFFFF に設定。256 グリフ上限だと大半の日本語グリフが範囲外となり ttf-parser が描画を拒否します。
-- **`re` オペレータの巻数方向**: PDF 仕様 §8.5.2.1 通り、`x y w h re` は w, h の符号によって巻数方向が変わります。負の寸法を正規化せず、`m`/`l`/`l`/`l`/`h` で展開することで「外側 CCW + 内側 CW」の組み合わせを保ち、非ゼロ巻数則 (`f`) で穴を正しく抜けます（例: 「文部科学省」ロゴ文字の白抜き部分）。
-
-## 依存クレート
-
-| クレート | 用途 |
-|---------|------|
-| [eframe](https://github.com/emilk/egui) / [egui](https://github.com/emilk/egui) | GUIフレームワーク |
-| pdf_oxide (ローカルフォーク) | PDFパース・レンダリング |
-| [windows](https://github.com/microsoft/windows-rs) | クリップボード操作 |
+| クレート | 用途・役割 |
+|---------|-----------|
+| [eframe](https://github.com/emilk/egui) / [egui](https://github.com/emilk/egui) | クロスプラットフォーム対応GUIフレームワーク |
+| pdf_oxide (ローカルフォーク) | 高品位PDF構造解析・ベクターラスタイザ |
+| [windows](https://github.com/microsoft/windows-rs) | Win32 APIを介したネイティブクリップボード連携（Windows限定） |
+| [wasm-bindgen](https://rustwasm.github.io/) / [web-sys](https://rustwasm.github.io/) | WebAssemblyブラウザAPI・DOM・Canvas連携（Wasm限定） |
 
 ## ライセンス
 
-MIT
+MIT License
