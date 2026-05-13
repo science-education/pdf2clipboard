@@ -254,13 +254,31 @@ fn cached_face(id: fontdb::ID, data: Arc<Vec<u8>>, index: u32) -> Option<Arc<Cac
     Some(arc)
 }
 
-/// Return true for CJK Unified Ideographs, Kana, Hangul, and related blocks.
-/// Used to limit the CJK fallback font to characters that actually need it,
-/// preventing Latin/Cyrillic/etc. glyphs from being drawn with Japanese fonts.
+/// Return true for CJK Unified Ideographs, Kana, Hangul, and related blocks,
+/// as well as symbols commonly present in CJK fonts (general punctuation,
+/// mathematical symbols, box-drawing, geometric shapes, etc.).
+///
+/// Used to decide whether the CJK fallback font should be tried when the
+/// primary font lacks a glyph. The range is deliberately broad: CJK system
+/// fonts (Yu Gothic, Meiryo, Noto Sans CJK) typically cover these symbol
+/// blocks, whereas Latin-only fonts do not.
+#[allow(dead_code)]
 fn is_cjk_or_kana(c: char) -> bool {
     let cp = c as u32;
     matches!(cp,
         0x1100..=0x11FF   // Hangul Jamo
+        | 0x2000..=0x206F  // General Punctuation (—, –, ', ', ", ", …, etc.)
+        | 0x2100..=0x214F  // Letterlike Symbols (℃, №, ℡, etc.)
+        | 0x2150..=0x218F  // Number Forms (fractions, Roman numerals)
+        | 0x2190..=0x21FF  // Arrows
+        | 0x2200..=0x22FF  // Mathematical Operators
+        | 0x2300..=0x23FF  // Miscellaneous Technical
+        | 0x2460..=0x24FF  // Enclosed Alphanumerics (①②③ etc.)
+        | 0x2500..=0x257F  // Box Drawing
+        | 0x2580..=0x259F  // Block Elements
+        | 0x25A0..=0x25FF  // Geometric Shapes (■, ●, ▲, etc.)
+        | 0x2600..=0x26FF  // Miscellaneous Symbols (☆, ♪, ♠, etc.)
+        | 0x2700..=0x27BF  // Dingbats
         | 0x2E80..=0x9FFF  // CJK Radicals, Kana, Bopomofo, CJK Unified Ideographs
         | 0xA960..=0xA97F  // Hangul Jamo Extended-A
         | 0xAC00..=0xD7FF  // Hangul Syllables
@@ -268,6 +286,8 @@ fn is_cjk_or_kana(c: char) -> bool {
         | 0xFE10..=0xFE6F  // Vertical Forms, CJK Compatibility Forms
         | 0xFF00..=0xFFEF  // Halfwidth / Fullwidth Forms
         | 0x1B000..=0x1B0FF // Kana Supplement
+        | 0x1F000..=0x1F02F // Mahjong Tiles
+        | 0x1F600..=0x1F64F // Emoticons
         | 0x20000..=0x2FA1F // CJK Extension B-F, Compatibility Supplement
     )
 }
@@ -418,9 +438,6 @@ static LATIN_FALLBACK: std::sync::OnceLock<
 
 fn get_latin_fallback_cached(db: &fontdb::Database) -> Option<(fontdb::ID, Arc<Vec<u8>>, u32)> {
     let preferred = preferred_latin_font_lock().lock().unwrap().clone();
-    if preferred.is_empty() {
-        return None;
-    }
     let cache_mutex = LATIN_FALLBACK.get_or_init(|| std::sync::Mutex::new(None));
     let mut cache = cache_mutex.lock().unwrap();
     if let Some((ref key, ref val)) = *cache {
@@ -428,20 +445,50 @@ fn get_latin_fallback_cached(db: &fontdb::Database) -> Option<(fontdb::ID, Arc<V
             return val.as_ref().map(|(id, arc, idx)| (*id, Arc::clone(arc), *idx));
         }
     }
-    let query = fontdb::Query {
-        families: &[fontdb::Family::Name(&preferred)],
-        weight: fontdb::Weight::NORMAL,
-        stretch: fontdb::Stretch::Normal,
-        style: fontdb::Style::Normal,
-    };
-    let result = db.query(&query).and_then(|id| {
-        cached_font_bytes(id, db).map(|(arc, idx)| (id, arc, idx))
-    });
+    let result = compute_latin_fallback(&preferred, db);
     *cache = Some((
         preferred,
         result.as_ref().map(|(id, arc, idx)| (*id, Arc::clone(arc), *idx)),
     ));
     result
+}
+
+fn compute_latin_fallback(
+    preferred: &str,
+    db: &fontdb::Database,
+) -> Option<(fontdb::ID, Arc<Vec<u8>>, u32)> {
+    // Build candidate list: user preference first, then automatic fallbacks
+    let auto_fallbacks: &[&str] = &[
+        "Arial",
+        "Times New Roman",
+        "Liberation Sans",
+        "Liberation Serif",
+        "DejaVu Sans",
+        "Noto Sans",
+        "FreeSans",
+    ];
+    let candidates: Vec<&str> = if preferred.is_empty() {
+        auto_fallbacks.to_vec()
+    } else {
+        let mut v = vec![preferred];
+        v.extend_from_slice(auto_fallbacks);
+        v
+    };
+    for name in candidates {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(name)],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        };
+        if let Some(id) = db.query(&query) {
+            if let Some((arc, idx)) = cached_font_bytes(id, db) {
+                log::debug!("Latin fallback: matched '{}'", name);
+                return Some((id, arc, idx));
+            }
+        }
+    }
+    None
 }
 
 /// Rasterizer for PDF text operations.
@@ -854,33 +901,65 @@ impl TextRasterizer {
         // Map well-known PDF/LaTeX font names to system font equivalents
         let mut variants = vec![final_name.to_string()];
 
-        // URW/TeX font mappings to URW base35 system fonts
-        if clean_name.contains("URWPalladioL") || clean_name.contains("Palatino") {
-            variants.insert(0, "P052".to_string());
-            variants.push("Palatino Linotype".to_string());
-            variants.push("TeX Gyre Pagella".to_string());
-        } else if clean_name.contains("NimbusRomNo9L") || clean_name.contains("NimbusRoman") {
-            variants.insert(0, "Nimbus Roman".to_string());
-            variants.push("Times New Roman".to_string());
-        } else if clean_name.contains("NimbusSanL") || clean_name.contains("NimbusSans") {
-            variants.insert(0, "Nimbus Sans".to_string());
-            variants.push("Arial".to_string());
-        } else if clean_name.contains("NimbusMonL") || clean_name.contains("NimbusMono") {
-            variants.insert(0, "Nimbus Mono PS".to_string());
-            variants.push("Courier New".to_string());
-        } else if clean_name.contains("CMSS")
-            || clean_name.contains("CMR")
-            || clean_name.contains("CMBX")
-        {
-            // Computer Modern fonts (LaTeX) — use Latin Modern or serif fallback
-            variants.push("Latin Modern Roman".to_string());
-            variants.push("Computer Modern".to_string());
-        } else if clean_name.contains("URWBookmanL") || clean_name.contains("Bookman") {
-            variants.insert(0, "Bookman URW".to_string());
-        } else if clean_name.contains("CenturySchL") || clean_name.contains("NewCentury") {
-            variants.insert(0, "C059".to_string());
-        } else if clean_name.contains("URWChanceryL") || clean_name.contains("Chancery") {
-            variants.insert(0, "Z003".to_string());
+        // PDF Standard 14 Fonts — explicit mappings (ISO 32000-1 §9.6.2.2)
+        // These must be available without embedding. Insert at front for priority.
+        match clean_name {
+            "Helvetica" | "Helvetica-Oblique" => {
+                variants.insert(0, "Arial".to_string());
+                variants.push("Helvetica".to_string());
+                variants.push("Liberation Sans".to_string());
+            },
+            "Helvetica-Bold" | "Helvetica-BoldOblique" => {
+                variants.insert(0, "Arial".to_string());
+                variants.push("Helvetica".to_string());
+                variants.push("Liberation Sans".to_string());
+            },
+            "Times-Roman" | "Times-Italic" => {
+                variants.insert(0, "Times New Roman".to_string());
+                variants.push("Liberation Serif".to_string());
+            },
+            "Times-Bold" | "Times-BoldItalic" => {
+                variants.insert(0, "Times New Roman".to_string());
+                variants.push("Liberation Serif".to_string());
+            },
+            "Courier" | "Courier-Oblique" => {
+                variants.insert(0, "Courier New".to_string());
+                variants.push("Liberation Mono".to_string());
+            },
+            "Courier-Bold" | "Courier-BoldOblique" => {
+                variants.insert(0, "Courier New".to_string());
+                variants.push("Liberation Mono".to_string());
+            },
+            _ => {
+                // URW/TeX font mappings to URW base35 system fonts
+                if clean_name.contains("URWPalladioL") || clean_name.contains("Palatino") {
+                    variants.insert(0, "P052".to_string());
+                    variants.push("Palatino Linotype".to_string());
+                    variants.push("TeX Gyre Pagella".to_string());
+                } else if clean_name.contains("NimbusRomNo9L") || clean_name.contains("NimbusRoman") {
+                    variants.insert(0, "Nimbus Roman".to_string());
+                    variants.push("Times New Roman".to_string());
+                } else if clean_name.contains("NimbusSanL") || clean_name.contains("NimbusSans") {
+                    variants.insert(0, "Nimbus Sans".to_string());
+                    variants.push("Arial".to_string());
+                } else if clean_name.contains("NimbusMonL") || clean_name.contains("NimbusMono") {
+                    variants.insert(0, "Nimbus Mono PS".to_string());
+                    variants.push("Courier New".to_string());
+                } else if clean_name.contains("CMSS")
+                    || clean_name.contains("CMR")
+                    || clean_name.contains("CMBX")
+                {
+                    // Computer Modern fonts (LaTeX) — use Latin Modern or serif fallback
+                    variants.push("Latin Modern Roman".to_string());
+                    variants.push("Computer Modern".to_string());
+                } else if clean_name.contains("URWBookmanL") || clean_name.contains("Bookman") {
+                    variants.insert(0, "Bookman URW".to_string());
+                } else if clean_name.contains("CenturySchL") || clean_name.contains("NewCentury") {
+                    variants.insert(0, "C059".to_string());
+                } else if clean_name.contains("URWChanceryL") || clean_name.contains("Chancery") {
+                    variants.insert(0, "Z003".to_string());
+                }
+            },
         }
 
         if is_cjk_probability {
@@ -915,8 +994,19 @@ impl TextRasterizer {
         variants.push("Noto Sans".to_string());
         variants.push("FreeSans".to_string());
 
-        let weight = if pdf_font_name.contains("Bold") || pdf_font_name.contains("Black") {
+        // Detect font weight from name — check specific sub-weights before generic "Bold"
+        let weight = if pdf_font_name.contains("ExtraBold") || pdf_font_name.contains("UltraBold") {
+            fontdb::Weight(800)
+        } else if pdf_font_name.contains("SemiBold") || pdf_font_name.contains("DemiBold") || pdf_font_name.contains("Demi") {
+            fontdb::Weight(600)
+        } else if pdf_font_name.contains("Bold") || pdf_font_name.contains("Black") || pdf_font_name.contains("Heavy") {
             fontdb::Weight::BOLD
+        } else if pdf_font_name.contains("Medium") {
+            fontdb::Weight(500)
+        } else if pdf_font_name.contains("Light") || pdf_font_name.contains("Thin") {
+            fontdb::Weight(300)
+        } else if pdf_font_name.contains("ExtraLight") || pdf_font_name.contains("UltraLight") {
+            fontdb::Weight(200)
         } else {
             fontdb::Weight::NORMAL
         };
@@ -1239,52 +1329,59 @@ impl TextRasterizer {
                 }
                 last_fallback_cluster = Some(cluster);
 
-                // CJK fallback: only for CJK/Kana/Hangul characters.
-                // Latin, Cyrillic, etc. must NOT fall through to Japanese fonts —
-                // those fonts contain full-width variants that look wrong for Latin text.
-                if !is_cjk_or_kana(char_at_pos) {
-                    // Non-CJK fallback: use the user-selected Latin/general font.
-                    if let Some((lat_id, lat_arc, lat_idx)) =
-                        get_latin_fallback_cached(self.font_db())
-                    {
-                        if let Some(lat_cached) = cached_face(lat_id, lat_arc, lat_idx) {
-                            if let Some(lat_gid) = lat_cached.ttf_face.glyph_index(char_at_pos) {
-                                let mut lat_pb = PathBuilder::new();
-                                let mut lat_builder = SkiaOutlineBuilder(&mut lat_pb);
-                                if lat_cached
-                                    .ttf_face
-                                    .outline_glyph(lat_gid, &mut lat_builder)
-                                    .is_some()
-                                {
-                                    if let Some(lat_path) = lat_pb.finish() {
-                                        let lat_scale = font_size / lat_cached.units_per_em;
-                                        let lat_transform = combined_base
-                                            .pre_translate(
-                                                (x_cursor + x_offset) * h_scale,
-                                                y_offset + gs.text_rise,
-                                            )
-                                            .pre_scale(lat_scale, lat_scale);
-                                        pixmap.fill_path(
-                                            &lat_path,
-                                            paint,
-                                            tiny_skia::FillRule::Winding,
-                                            lat_transform,
-                                            clip_mask,
+                // SEQUENTIAL FALLBACK: try Latin first (covers Latin, Greek,
+                // Cyrillic, common symbols), then CJK (covers CJK ideographs,
+                // kana, fullwidth forms, and many symbol blocks).
+                //
+                // Unlike the previous exclusive CJK/non-CJK branch, this
+                // sequential approach ensures that a character missing from
+                // the Latin fallback still gets a chance via the CJK font,
+                // and vice versa.  MuPDF uses a similar multi-stage strategy.
+
+                // Stage 1: Latin / general fallback
+                if let Some((lat_id, lat_arc, lat_idx)) =
+                    get_latin_fallback_cached(self.font_db())
+                {
+                    if let Some(lat_cached) = cached_face(lat_id, lat_arc, lat_idx) {
+                        if let Some(lat_gid) = lat_cached.ttf_face.glyph_index(char_at_pos) {
+                            let mut lat_pb = PathBuilder::new();
+                            let mut lat_builder = SkiaOutlineBuilder(&mut lat_pb);
+                            if lat_cached
+                                .ttf_face
+                                .outline_glyph(lat_gid, &mut lat_builder)
+                                .is_some()
+                            {
+                                if let Some(lat_path) = lat_pb.finish() {
+                                    let lat_scale = font_size / lat_cached.units_per_em;
+                                    let lat_transform = combined_base
+                                        .pre_translate(
+                                            (x_cursor + x_offset) * h_scale,
+                                            y_offset + gs.text_rise,
+                                        )
+                                        .pre_scale(lat_scale, lat_scale);
+                                    pixmap.fill_path(
+                                        &lat_path,
+                                        paint,
+                                        tiny_skia::FillRule::Winding,
+                                        lat_transform,
+                                        clip_mask,
+                                    );
+                                    has_outline = true;
+                                    if let Some(adv) =
+                                        lat_cached.ttf_face.glyph_hor_advance(lat_gid)
+                                    {
+                                        x_advance_override = Some(
+                                            adv as f32 / lat_cached.units_per_em * font_size,
                                         );
-                                        has_outline = true;
-                                        if let Some(adv) =
-                                            lat_cached.ttf_face.glyph_hor_advance(lat_gid)
-                                        {
-                                            x_advance_override = Some(
-                                                adv as f32 / lat_cached.units_per_em * font_size,
-                                            );
-                                        }
                                     }
                                 }
                             }
                         }
                     }
-                } else if is_cjk_or_kana(char_at_pos) {
+                }
+
+                // Stage 2: CJK fallback (try for ANY character the Latin font missed)
+                if !has_outline {
                     if let Some((cjk_id, cjk_arc, cjk_index)) =
                         get_cjk_fallback_cached(self.font_db())
                     {
@@ -1437,8 +1534,9 @@ impl TextRasterizer {
             let char_at_pos = char_str.chars().next().unwrap_or('\0');
 
             // Draw glyph outline
-            if gid != 0 || char_at_pos.is_whitespace() {
-                if !char_at_pos.is_whitespace() {
+            let mut rendered = false;
+            if !char_at_pos.is_whitespace() {
+                if gid != 0 {
                     let mut pb = PathBuilder::new();
                     let mut builder = SkiaOutlineBuilder(&mut pb);
                     if ttf_face
@@ -1456,7 +1554,96 @@ impl TextRasterizer {
                                 glyph_transform,
                                 clip_mask,
                             );
+                            rendered = true;
                         }
+                    }
+                }
+
+                // Per-glyph system font fallback when embedded font lacks the glyph.
+                // This mirrors MuPDF's multi-stage fallback strategy: when the primary
+                // font returns GID=0 (or has no outline), try Latin then CJK system
+                // fonts before giving up.
+                if !rendered && char_at_pos != '\0' {
+                    // Stage 1: Latin / general fallback
+                    if let Some((lat_id, lat_arc, lat_idx)) =
+                        get_latin_fallback_cached(self.font_db())
+                    {
+                        if let Some(lat_cached) = cached_face(lat_id, lat_arc, lat_idx) {
+                            if let Some(lat_gid) = lat_cached.ttf_face.glyph_index(char_at_pos) {
+                                let mut lat_pb = PathBuilder::new();
+                                let mut lat_builder = SkiaOutlineBuilder(&mut lat_pb);
+                                if lat_cached
+                                    .ttf_face
+                                    .outline_glyph(lat_gid, &mut lat_builder)
+                                    .is_some()
+                                {
+                                    if let Some(lat_path) = lat_pb.finish() {
+                                        let lat_scale = font_size / lat_cached.units_per_em;
+                                        let glyph_transform = combined_base
+                                            .pre_translate(x_cursor * h_scale, gs.text_rise)
+                                            .pre_scale(lat_scale, lat_scale);
+                                        pixmap.fill_path(
+                                            &lat_path,
+                                            paint,
+                                            tiny_skia::FillRule::Winding,
+                                            glyph_transform,
+                                            clip_mask,
+                                        );
+                                        rendered = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Stage 2: CJK fallback
+                    if !rendered {
+                        if let Some((cjk_id, cjk_arc, cjk_idx)) =
+                            get_cjk_fallback_cached(self.font_db())
+                        {
+                            if let Some(cjk_cached) = cached_face(cjk_id, cjk_arc, cjk_idx) {
+                                if let Some(cjk_gid) =
+                                    cjk_cached.ttf_face.glyph_index(char_at_pos)
+                                {
+                                    let mut cjk_pb = PathBuilder::new();
+                                    let mut cjk_builder = SkiaOutlineBuilder(&mut cjk_pb);
+                                    if cjk_cached
+                                        .ttf_face
+                                        .outline_glyph(cjk_gid, &mut cjk_builder)
+                                        .is_some()
+                                    {
+                                        if let Some(cjk_path) = cjk_pb.finish() {
+                                            let cjk_scale =
+                                                font_size / cjk_cached.units_per_em;
+                                            let glyph_transform = combined_base
+                                                .pre_translate(
+                                                    x_cursor * h_scale,
+                                                    gs.text_rise,
+                                                )
+                                                .pre_scale(cjk_scale, cjk_scale);
+                                            pixmap.fill_path(
+                                                &cjk_path,
+                                                paint,
+                                                tiny_skia::FillRule::Winding,
+                                                glyph_transform,
+                                                clip_mask,
+                                            );
+                                            rendered = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !rendered {
+                        log::debug!(
+                            "render_cid_direct: no glyph for char='{}' (0x{:X}), gid={}, font='{}'",
+                            char_at_pos,
+                            char_at_pos as u32,
+                            gid,
+                            font_info.base_font
+                        );
                     }
                 }
             }

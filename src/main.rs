@@ -308,7 +308,7 @@ fn sharpen_rgba(pixels: &mut Vec<egui::Color32>, w: usize, h: usize) {
     if w < 3 || h < 3 { return; }
     let src = pixels.clone();
     #[rustfmt::skip]
-    const K: [f32; 9] = [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0];
+    const K: [f32; 9] = [0.0, -0.5, 0.0, -0.5, 3.0, -0.5, 0.0, -0.5, 0.0];
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
