@@ -251,7 +251,7 @@ pub mod debug;
 pub mod signatures;
 
 // Parallel page extraction (optional, v0.3.10)
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "parallel")))]
 pub mod parallel;
 
@@ -314,7 +314,7 @@ pub use fonts::global_cache::{
 // Global CMap cache management
 pub use fonts::cmap::{clear_cmap_cache, cmap_cache_size};
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub use parallel::{extract_all_markdown_parallel, extract_all_text_parallel, ParallelExtractor};
 
 // Internal utilities

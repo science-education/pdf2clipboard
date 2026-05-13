@@ -9,6 +9,8 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     mpsc, Arc, Mutex,
 };
+
+#[cfg(windows)]
 use windows::Win32::{
     Graphics::Gdi::BI_RGB,
     System::{
@@ -16,6 +18,9 @@ use windows::Win32::{
         Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
     },
 };
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -26,7 +31,7 @@ struct PageSlot {
 }
 
 struct App {
-    pdf_bytes:       Option<Arc<Vec<u8>>>,
+    pdf_bytes:       Option<Arc<[u8]>>,
     page_count:      u32,
     pages:           Vec<PageSlot>,
     thumb_size:      u32,
@@ -44,7 +49,10 @@ fn build_doc(bytes: &[u8]) -> Result<PdfDocument, String> {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
+    #[allow(unused_mut)]
     let mut fonts = egui::FontDefinitions::default();
+    
+    #[cfg(windows)]
     for path in &[
         "C:/Windows/Fonts/meiryo.ttc",
         "C:/Windows/Fonts/yugothm.ttc",
@@ -61,6 +69,15 @@ fn setup_fonts(ctx: &egui::Context) {
             break;
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // On Web, we can't access local system fonts.
+        // The user should bundle a font or we use the default.
+        // For demonstration, we could use include_bytes! here if a font was available.
+        log::warn!("Japanese fonts are not bundled for Web. CJK text may not render correctly in UI.");
+    }
+
     ctx.set_fonts(fonts);
 }
 
@@ -86,20 +103,32 @@ impl App {
         }
     }
 
-    fn load_pdf(&mut self, path: &str) {
-        match self.do_load(path) {
+    fn load_pdf_path(&mut self, path: &str) {
+        let _ = path;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match std::fs::read(path) {
+                Ok(data) => self.load_pdf_bytes(data.into(), Some(path)),
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+             self.status = "Direct file path access is not supported on Web. Use drag-and-drop.".into();
+        }
+    }
+
+    fn load_pdf_bytes(&mut self, bytes: Arc<[u8]>, name: Option<&str>) {
+        match self.do_load(bytes) {
             Ok(n) => {
-                let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-                self.status = format!("{name}  ({n} pages)  —  click a page to copy");
+                let display_name = name.map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p)).unwrap_or("PDF");
+                self.status = format!("{display_name}  ({n} pages)  —  click a page to copy");
             }
             Err(e) => self.status = format!("Error: {e}"),
         }
     }
 
-    fn do_load(&mut self, path: &str) -> Result<u32, String> {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let bytes = Arc::new(data);
-
+    fn do_load(&mut self, bytes: Arc<[u8]>) -> Result<u32, String> {
         let doc = build_doc(&bytes)?;
         let n = doc.page_count().map_err(|e| e.to_string())? as u32;
 
@@ -134,22 +163,30 @@ impl App {
             None => return,
         };
 
-        let gen        = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        let render_gen = Arc::clone(&self.render_gen);
-        let tx         = self.tx.clone();
-        let next_page  = Arc::new(Mutex::new(0u32));
+        let _gen        = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let _render_gen = Arc::clone(&self.render_gen);
+        let _tx         = self.tx.clone();
+        let _next_page  = Arc::new(Mutex::new(0u32));
+        let _page_count = page_count;
+        let _thumb_size = thumb_size;
+        let _bytes      = Arc::clone(&bytes);
 
-        let n_threads = std::thread::available_parallelism()
-            .map(|p| p.get().saturating_sub(1).max(1))
-            .unwrap_or(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let gen = _gen;
+            let render_gen = _render_gen;
+            let tx = _tx;
+            let next_page = _next_page;
+            let page_count = _page_count;
+            let thumb_size = _thumb_size;
+            let bytes = _bytes;
+            for _ in 0..self.n_threads {
+                let bytes     = Arc::clone(&bytes);
+                let tx        = tx.clone();
+                let next_page = Arc::clone(&next_page);
+                let rgen      = Arc::clone(&render_gen);
 
-        for _ in 0..n_threads {
-            let bytes     = Arc::clone(&bytes);
-            let tx        = tx.clone();
-            let next_page = Arc::clone(&next_page);
-            let rgen      = Arc::clone(&render_gen);
-
-            std::thread::spawn(move || {
+                std::thread::spawn(move || {
                 let doc = match build_doc(&bytes) {
                     Ok(d) => d,
                     Err(_) => return,
@@ -171,6 +208,16 @@ impl App {
                     }
                 }
             });
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On Web, we can't easily spawn threads.
+            // For now, we perform rendering in a single-threaded background "loop"
+            // using request_animation_frame or simply processing a few per frame.
+            // A more robust way is to use Web Workers, but that requires more setup.
+            log::info!("Starting single-threaded rendering for Wasm");
         }
     }
 
@@ -186,7 +233,12 @@ impl App {
                 Ok(img) => {
                     let w = img.size[0];
                     let h = img.size[1];
-                    clipboard_set(&img);
+                    #[cfg(windows)]
+                    clipboard_set_windows(&img);
+                    
+                    #[cfg(target_arch = "wasm32")]
+                    clipboard_set_web(&img);
+
                     self.status = format!("Page {} copied  ({w}×{h} px @ {dpi} DPI)", page_num + 1);
                 }
                 Err(e) => self.status = format!("Error copying page {}: {e}", page_num + 1),
@@ -277,7 +329,8 @@ fn sharpen_rgba(pixels: &mut Vec<egui::Color32>, w: usize, h: usize) {
 // Clipboard  (CF_DIB / 24-bit BGR, bottom-up)
 // ---------------------------------------------------------------------------
 
-fn clipboard_set(img: &ColorImage) {
+#[cfg(windows)]
+fn clipboard_set_windows(img: &ColorImage) {
     let w = img.size[0] as i32;
     let h = img.size[1] as i32;
     let row_stride = (w * 3 + 3) & !3_i32;
@@ -331,6 +384,14 @@ fn clipboard_set(img: &ColorImage) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn clipboard_set_web(_img: &ColorImage) {
+    // For Web, copying images to clipboard is complex and requires navigator.clipboard.
+    // Usually it needs to be a Blob.
+    // For now, we just log a message.
+    log::info!("Image copy to clipboard is not yet implemented for Web.");
+}
+
 // ---------------------------------------------------------------------------
 // egui App
 // ---------------------------------------------------------------------------
@@ -339,11 +400,20 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
-            if let Some(p) = &f.path {
+            if let Some(bytes) = f.bytes {
+                self.load_pdf_bytes(Arc::clone(&bytes), Some(&f.name));
+            } else if let Some(p) = &f.path {
                 if p.extension().map_or(false, |e| e == "pdf") {
-                    self.load_pdf(&p.to_string_lossy());
+                    self.load_pdf_path(&p.to_string_lossy());
                 }
             }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        if self.pdf_bytes.is_some() {
+             // Wasm single-threaded rendering "driver"
+             // Process one page per frame to keep UI responsive
+             self.drive_render_wasm(ctx);
         }
 
         {
@@ -464,10 +534,45 @@ impl eframe::App for App {
     }
 }
 
+impl App {
+    #[cfg(target_arch = "wasm32")]
+    fn drive_render_wasm(&self, ctx: &egui::Context) {
+        // This is a simple single-threaded renderer for Wasm.
+        // It picks up the next page and renders it if the texture is missing.
+        let page_count = self.page_count;
+        let thumb_size = self.thumb_size;
+        let bytes = match &self.pdf_bytes {
+            Some(b) => Arc::clone(b),
+            None => return,
+        };
+
+        // Find first page that needs rendering
+        let mut target_idx = None;
+        for i in 0..page_count as usize {
+            if self.pages[i].tex.is_none() {
+                target_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(i) = target_idx {
+            let doc = match build_doc(&bytes) {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            if let Ok(img) = pdf_render(&doc, i, thumb_size as f32, None) {
+                let _ = self.tx.send((i, img));
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -481,4 +586,32 @@ fn main() {
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     ).unwrap();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    // Redirect log to console
+    console_log::init_with_level(log::Level::Info).expect("error initializing logger");
+    
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let canvas_id = "the_canvas_id";
+        let document = web_sys::window()
+            .and_then(|win| win.document())
+            .expect("Could not find window or document");
+        let canvas = document
+            .get_element_by_id(canvas_id)
+            .and_then(|element| element.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            .expect("Could not find canvas element");
+
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(App::new(cc)))),
+            )
+            .await
+            .expect("failed to start eframe");
+    });
 }

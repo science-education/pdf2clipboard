@@ -1080,19 +1080,15 @@ impl TextRasterizer {
         let font_size = gs.font_size;
         let h_scale = gs.horizontal_scaling / 100.0;
 
-        // 1. Resolve faces — prefer process-wide cache to avoid re-parsing font tables
-        //    on every text segment.  Embedded fonts (font_id == None) are not cached
-        //    because they are unique per-PDF and typically only rendered once.
+        // 1. Get font faces — prefer process-wide cache to avoid re-parsing font tables
+        //    on every text segment.
         let cached_arc: Option<Arc<CachedFace>> =
             font_id.and_then(|id| cached_face(id, Arc::clone(&font_data), index));
 
-        // Storage for locally-created faces when there is no cache entry
-        // (embedded fonts, first-ever render of a system font).
-        let _local_rb: Option<rustybuzz::Face<'_>>;
-        let _local_ttf: Option<ttf_parser::Face<'_>>;
-
-        let rb_face_ref: &rustybuzz::Face<'_>;
-        let ttf_face_ref: &ttf_parser::Face<'_>;
+        let _local_rb: Option<rustybuzz::Face>;
+        let _local_ttf: Option<ttf_parser::Face>;
+        let rb_face_ref: &rustybuzz::Face;
+        let ttf_face_ref: &ttf_parser::Face;
         let units_per_em: f32;
 
         if let Some(ref c) = cached_arc {
@@ -1105,42 +1101,15 @@ impl TextRasterizer {
             let rb_opt = rustybuzz::Face::from_slice(&font_data, index);
             if rb_opt.is_none() {
                 if allow_fallback {
-                    log::warn!("Failed to create rustybuzz face from embedded data for '{}', falling back to system font", pdf_font_name);
-                    if let Some((fb_id, fallback_data, fallback_index)) =
-                        self.load_font_data(pdf_font_name)
-                    {
-                        return self.render_unicode_text(
-                            pixmap,
-                            text,
-                            bytes,
-                            font_info,
-                            Some(fb_id),
-                            fallback_data,
-                            fallback_index,
-                            paint,
-                            stroke_info,
-                            base_transform,
-                            gs,
-                            clip_mask,
-                            pdf_font_name,
-                            false, // don't allow infinite fallback
-                        );
+                    if let Some((fb_id, fallback_data, fallback_index)) = self.load_font_data(pdf_font_name) {
+                        return self.render_unicode_text(pixmap, text, bytes, font_info, Some(fb_id), fallback_data, fallback_index, paint, stroke_info, base_transform, gs, clip_mask, pdf_font_name, false);
                     }
                 }
-                return self.render_text_fallback(
-                    pixmap,
-                    text,
-                    paint,
-                    base_transform,
-                    gs,
-                    clip_mask,
-                );
+                return self.render_text_fallback(pixmap, text, paint, base_transform, gs, clip_mask);
             }
             _local_rb = rb_opt;
             _local_ttf = ttf_parser::Face::parse(&font_data, index).ok();
-            if _local_ttf.is_none() {
-                return Err(Error::InvalidPdf(format!("Failed to parse font: {}", pdf_font_name)));
-            }
+            if _local_ttf.is_none() { return Err(Error::InvalidPdf(format!("Failed to parse font: {}", pdf_font_name))); }
             rb_face_ref = _local_rb.as_ref().unwrap();
             ttf_face_ref = _local_ttf.as_ref().unwrap();
             units_per_em = ttf_face_ref.units_per_em() as f32;
@@ -1151,361 +1120,139 @@ impl TextRasterizer {
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(text);
 
-        // Explicitly set script and direction for better CJK shaping
-        if text
-            .chars()
-            .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF)
-        {
-            if let Some(script) = rustybuzz::Script::from_iso15924_tag(
-                rustybuzz::ttf_parser::Tag::from_bytes(b"Hani"),
-            ) {
+        if text.chars().any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF) {
+            if let Some(script) = rustybuzz::Script::from_iso15924_tag(rustybuzz::ttf_parser::Tag::from_bytes(b"Hani")) {
                 buffer.set_script(script);
             }
         }
-        if wmode == 1 {
-            buffer.set_direction(rustybuzz::Direction::TopToBottom);
-        } else {
-            buffer.set_direction(rustybuzz::Direction::LeftToRight);
-        }
+        if wmode == 1 { buffer.set_direction(rustybuzz::Direction::TopToBottom); } else { buffer.set_direction(rustybuzz::Direction::LeftToRight); }
 
         // 3. Shape the text
-        let glyphs = rustybuzz::shape(rb_face_ref, &[], buffer);
-        let info = glyphs.glyph_infos();
-        let pos = glyphs.glyph_positions();
-
+        let shaped = rustybuzz::shape(rb_face_ref, &[], buffer);
+        let glyphs = shaped.glyph_infos();
+        let pos = shaped.glyph_positions();
         let scale = font_size / units_per_em;
-        log::debug!(
-            "render_unicode_text: pdf_font={}, units_per_em={}, font_size={}, scale={}",
-            pdf_font_name,
-            units_per_em,
-            font_size,
-            scale
-        );
 
-        // 4. Transform setup - include full text matrix [Tm]
-        let text_transform = Transform::from_row(
-            gs.text_matrix.a,
-            gs.text_matrix.b,
-            gs.text_matrix.c,
-            gs.text_matrix.d,
-            gs.text_matrix.e,
-            gs.text_matrix.f,
-        );
-        // Transform from text space to pixel space: P_pixel = base_transform * text_transform * P_text
+        // 4. Transform setup
+        let text_transform = Transform::from_row(gs.text_matrix.a, gs.text_matrix.b, gs.text_matrix.c, gs.text_matrix.d, gs.text_matrix.e, gs.text_matrix.f);
         let combined_base = base_transform.pre_concat(text_transform);
 
-        let mut x_cursor: f32 = 0.0; // In text space units
+        let mut x_cursor: f32 = 0.0;
+        let mut y_cursor: f32 = 0.0;
         let mut last_fallback_cluster: Option<usize> = None;
-
-        // Pre-resolve CIDs for Type0 fonts using our iterator
-        let cids: Vec<u16> = if let Some(info) = font_info {
-            if info.subtype == "Type0" {
-                TextCharIter::new(bytes, Some(info))
-                    .map(|(cid, _)| cid)
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Build mapping from Unicode byte offset → character index for correct CID lookup.
-        // Rustybuzz clusters are byte offsets into the Unicode string, but we need
-        // the character index to map to the corresponding CID.
-        let cluster_to_char_idx: HashMap<usize, usize> = text
-            .char_indices()
-            .enumerate()
-            .map(|(char_idx, (byte_offset, _))| (byte_offset, char_idx))
-            .collect();
+        let unicode_chars: Vec<char> = text.chars().collect();
 
         // 5. Iterate through shaped glyphs
-        for i in 0..info.len() {
-            let glyph_id = info[i].glyph_id;
-            let cluster = info[i].cluster as usize;
+        for i in 0..glyphs.len() {
+            let glyph = &glyphs[i];
+            let p = &pos[i];
+            let cluster = glyph.cluster as usize;
+            let char_at_pos = if cluster < unicode_chars.len() { unicode_chars[cluster] } else { '\0' };
 
-            // Get character at this cluster (byte offset)
-            let char_at_pos = text[cluster..].chars().next().unwrap_or(' ');
+            let mut has_outline = false;
+            let mut x_advance_override = None;
 
-            // Map cluster (Unicode byte offset) to character index
-            let char_idx = cluster_to_char_idx.get(&cluster).copied().unwrap_or(0);
+            // Vertical origin shift for CID fonts
+            let (v_shift_x, v_shift_y) = if wmode == 1 { (-500.0 * scale, -880.0 * scale) } else { (0.0, 0.0) };
 
-            // Determine how many *source* characters this glyph represents.
-            // For normal 1:1 glyphs, cluster_chars == 1. For shaped
-            // ligatures like the "ffi" glyph (#331 R2), one glyph covers
-            // multiple characters and rustybuzz reports them with the
-            // same cluster index on every glyph of the cluster. Since we
-            // advance the output cursor by the sum of the PDF-declared
-            // widths of the *source* characters (per PDF §9.2.4 text-
-            // showing advance), we must add the widths of every source
-            // character in the ligature cluster to the cursor, not just
-            // the first character's width. Otherwise a ligature glyph
-            // draws wide but only advances by one character's worth, and
-            // subsequent glyphs overwrite the tail of the ligature —
-            // exactly the `Efficient` → `Effi ert` symptom reported in
-            // #331 on arxiv-style LaTeX-embedded fonts.
-            let next_cluster_byte: usize = info
-                .get(i + 1)
-                .map(|n| n.cluster as usize)
-                .unwrap_or(text.len());
-            let cluster_chars: usize = text[cluster..next_cluster_byte.min(text.len())]
-                .chars()
-                .count()
-                .max(1);
-
-            // PDF Spec: tx = ((w0 * Tfs) + Tc + Tw) * Th
-            // Priority:
-            // 1. Explicit /W or /DW from FontInfo (in 1000ths of em),
-            //    summed across every source character in the cluster
-            //    so ligatures advance by the full cluster's width.
-            // 2. Shaped advance from rustybuzz (fallback, already
-            //    reflects the ligature's real width because it comes
-            //    from the font's horizontal metrics table).
-            let pdf_width = if let Some(font_info_ref) = font_info {
-                let mut sum = 0.0_f32;
-                for k in 0..cluster_chars {
-                    let idx = char_idx + k;
-                    let char_code = if font_info_ref.subtype == "Type0" {
-                        *cids.get(idx).unwrap_or(&0)
-                    } else {
-                        *bytes.get(idx).unwrap_or(&0) as u16
-                    };
-                    sum += font_info_ref.get_glyph_width(char_code);
-                }
-                sum
-            } else {
-                // No FontInfo, use shaped advance
-                pos[i].x_advance as f32 / font_size * 1000.0
-            };
-
-            let x_advance = pdf_width * font_size / 1000.0;
-            let x_offset = pos[i].x_offset as f32 / units_per_em * font_size;
-            let y_offset = pos[i].y_offset as f32 / units_per_em * font_size;
-
-            let mut x_advance_override: Option<f32> = None;
-
-            // Try to get glyph from primary font
-            let mut pb = PathBuilder::new();
-            let mut builder = SkiaOutlineBuilder(&mut pb);
-            let mut has_outline = ttf_face_ref
-                .outline_glyph(ttf_parser::GlyphId(glyph_id as u16), &mut builder)
-                .is_some();
-
-            if has_outline && glyph_id != 0 {
-                if let Some(path) = pb.finish() {
-                    let glyph_transform = combined_base
-                        .pre_translate((x_cursor + x_offset) * h_scale, y_offset + gs.text_rise)
-                        .pre_scale(scale, scale);
-
-                    pixmap.fill_path(
-                        &path,
-                        paint,
-                        tiny_skia::FillRule::EvenOdd,
-                        glyph_transform,
-                        clip_mask,
-                    );
-                    if let Some((sp, stroke)) = stroke_info {
-                        pixmap.stroke_path(&path, sp, stroke, glyph_transform, clip_mask);
+            // Priority 0: Primary font outline
+            if glyph.glyph_id != 0 {
+                let mut pb = PathBuilder::new();
+                let mut builder = SkiaOutlineBuilder(&mut pb);
+                if ttf_face_ref.outline_glyph(ttf_parser::GlyphId(glyph.glyph_id as u16), &mut builder).is_some() {
+                    if let Some(path) = pb.finish() {
+                        let t = combined_base.pre_translate((x_cursor + p.x_offset as f32 / units_per_em * font_size + v_shift_x) * h_scale, y_cursor + p.y_offset as f32 / units_per_em * font_size + v_shift_y + gs.text_rise).pre_scale(scale, scale);
+                        pixmap.fill_path(&path, paint, tiny_skia::FillRule::EvenOdd, t, clip_mask);
+                        if let Some((sp, stroke)) = stroke_info { pixmap.stroke_path(&path, sp, stroke, t, clip_mask); }
+                        has_outline = true;
                     }
                 }
-                // Vertical writing: replace horizontal advance with vertical advance
-                // when the font has a vmtx table. Falls back to horizontal if absent.
                 if wmode == 1 {
-                    if let Some(va) = ttf_face_ref
-                        .glyph_ver_advance(ttf_parser::GlyphId(glyph_id as u16))
-                    {
+                    if let Some(va) = ttf_face_ref.glyph_ver_advance(ttf_parser::GlyphId(glyph.glyph_id as u16)) {
                         x_advance_override = Some(va as f32 / units_per_em * font_size);
                     }
                 }
-            } else {
-                // FALLBACK PATH: primary font has no outline for this glyph.
+            }
 
-                // Skip whitespace — advance is still applied below.
+            if !has_outline {
+                // FALLBACK PATH
                 if char_at_pos.is_whitespace() {
-                    x_cursor += x_advance;
-                    x_cursor += gs.char_space;
-                    if char_at_pos == ' ' {
-                        x_cursor += gs.word_space;
-                    }
+                    let advance = if wmode == 1 { font_size } else { p.x_advance as f32 / units_per_em * font_size };
+                    if wmode == 1 { y_cursor -= advance; y_cursor -= gs.char_space; } else { x_cursor += advance; x_cursor += gs.char_space; }
                     continue;
                 }
 
-                // Only render fallback character ONCE per cluster.
                 if last_fallback_cluster == Some(cluster) {
-                    x_cursor += x_advance;
+                    let advance = p.x_advance as f32 / units_per_em * font_size;
+                    if wmode == 1 { y_cursor -= advance; } else { x_cursor += advance; }
                     continue;
                 }
                 last_fallback_cluster = Some(cluster);
 
-                // SEQUENTIAL FALLBACK:
-                // Stage 0 – re-query the embedded font itself via direct Unicode
-                //           cmap lookup (glyph_index). rustybuzz sometimes returns
-                //           GID=0 (.notdef) when the shaping pipeline doesn't find
-                //           a cluster match, even though the font's own cmap has the
-                //           glyph under the Unicode codepoint. MuPDF always attempts
-                //           a direct cmap lookup before falling back to system fonts.
-                // Stage 1 – Latin / general system font
-                // Stage 2 – CJK system font
-
-                // Stage 0: direct cmap lookup in the primary (embedded) font
+                // Stage 0: direct cmap lookup
                 if let Some(direct_gid) = ttf_face_ref.glyph_index(char_at_pos) {
                     let mut pb0 = PathBuilder::new();
                     let mut b0 = SkiaOutlineBuilder(&mut pb0);
                     if ttf_face_ref.outline_glyph(direct_gid, &mut b0).is_some() {
                         if let Some(path0) = pb0.finish() {
-                            let t0 = combined_base
-                                .pre_translate(
-                                    (x_cursor + x_offset) * h_scale,
-                                    y_offset + gs.text_rise,
-                                )
-                                .pre_scale(scale, scale);
-                            pixmap.fill_path(
-                                &path0,
-                                paint,
-                                tiny_skia::FillRule::EvenOdd,
-                                t0,
-                                clip_mask,
-                            );
-                            if let Some((sp, stroke)) = stroke_info {
-                                pixmap.stroke_path(&path0, sp, stroke, t0, clip_mask);
-                            }
+                            let t0 = combined_base.pre_translate((x_cursor + p.x_offset as f32 / units_per_em * font_size + v_shift_x) * h_scale, y_cursor + p.y_offset as f32 / units_per_em * font_size + v_shift_y + gs.text_rise).pre_scale(scale, scale);
+                            pixmap.fill_path(&path0, paint, tiny_skia::FillRule::EvenOdd, t0, clip_mask);
+                            if let Some((sp, stroke)) = stroke_info { pixmap.stroke_path(&path0, sp, stroke, t0, clip_mask); }
                             has_outline = true;
                         }
                     }
                 }
 
-                // Stage 1: Latin / general fallback
-                if let Some((lat_id, lat_arc, lat_idx)) =
-                    get_latin_fallback_cached(self.font_db())
-                {
-                    if let Some(lat_cached) = cached_face(lat_id, lat_arc, lat_idx) {
-                        if let Some(lat_gid) = lat_cached.ttf_face.glyph_index(char_at_pos) {
-                            let mut lat_pb = PathBuilder::new();
-                            let mut lat_builder = SkiaOutlineBuilder(&mut lat_pb);
-                            if lat_cached
-                                .ttf_face
-                                .outline_glyph(lat_gid, &mut lat_builder)
-                                .is_some()
-                            {
-                                if let Some(lat_path) = lat_pb.finish() {
-                                    let lat_scale = font_size / lat_cached.units_per_em;
-                                    let lat_transform = combined_base
-                                        .pre_translate(
-                                            (x_cursor + x_offset) * h_scale,
-                                            y_offset + gs.text_rise,
-                                        )
-                                        .pre_scale(lat_scale, lat_scale);
-                                    pixmap.fill_path(
-                                        &lat_path,
-                                        paint,
-                                        tiny_skia::FillRule::EvenOdd,
-                                        lat_transform,
-                                        clip_mask,
-                                    );
-                                    if let Some((sp, stroke)) = stroke_info {
-                                        pixmap.stroke_path(
-                                            &lat_path, sp, stroke, lat_transform, clip_mask,
-                                        );
+                // Stage 1: Latin fallback
+                if !has_outline {
+                    if let Some((lat_id, lat_arc, lat_idx)) = get_latin_fallback_cached(self.font_db()) {
+                        if let Some(lat_cached) = cached_face(lat_id, lat_arc, lat_idx) {
+                            if let Some(lat_gid) = lat_cached.ttf_face.glyph_index(char_at_pos) {
+                                let mut lat_pb = PathBuilder::new();
+                                let mut lat_builder = SkiaOutlineBuilder(&mut lat_pb);
+                                if lat_cached.ttf_face.outline_glyph(lat_gid, &mut lat_builder).is_some() {
+                                    if let Some(lat_path) = lat_pb.finish() {
+                                        let lat_scale = font_size / lat_cached.units_per_em;
+                                        let (lv_shift_x, lv_shift_y) = if wmode == 1 { (-500.0 * lat_scale, -880.0 * lat_scale) } else { (0.0, 0.0) };
+                                        let t_lat = combined_base.pre_translate((x_cursor + p.x_offset as f32 / units_per_em * font_size + lv_shift_x) * h_scale, y_cursor + p.y_offset as f32 / units_per_em * font_size + lv_shift_y + gs.text_rise).pre_scale(lat_scale, lat_scale);
+                                        pixmap.fill_path(&lat_path, paint, tiny_skia::FillRule::EvenOdd, t_lat, clip_mask);
+                                        if let Some((sp, stroke)) = stroke_info { pixmap.stroke_path(&lat_path, sp, stroke, t_lat, clip_mask); }
+                                        has_outline = true;
                                     }
-                                    has_outline = true;
-                                    // Do NOT override x_advance with fallback font metrics:
-                                    // PDF-declared advance is preserved (MuPDF behaviour).
                                 }
                             }
                         }
                     }
                 }
 
-                // Stage 2: CJK fallback (try for ANY character the Latin font missed)
+                // Stage 2: CJK fallback
                 if !has_outline {
-                    if let Some((cjk_id, cjk_arc, cjk_index)) =
-                        get_cjk_fallback_cached(self.font_db())
-                    {
-                        if let Some(cjk_cached) = cached_face(cjk_id, cjk_arc, cjk_index) {
-                            if let Some(cjk_glyph_id) =
-                                cjk_cached.ttf_face.glyph_index(char_at_pos)
-                            {
+                    if let Some((cjk_id, cjk_arc, cjk_idx)) = get_cjk_fallback_cached(self.font_db()) {
+                        if let Some(cjk_cached) = cached_face(cjk_id, cjk_arc, cjk_idx) {
+                            if let Some(cjk_gid) = cjk_cached.ttf_face.glyph_index(char_at_pos) {
                                 let mut cjk_pb = PathBuilder::new();
                                 let mut cjk_builder = SkiaOutlineBuilder(&mut cjk_pb);
-                                if cjk_cached
-                                    .ttf_face
-                                    .outline_glyph(cjk_glyph_id, &mut cjk_builder)
-                                    .is_some()
-                                {
+                                if cjk_cached.ttf_face.outline_glyph(cjk_gid, &mut cjk_builder).is_some() {
                                     if let Some(cjk_path) = cjk_pb.finish() {
                                         let cjk_scale = font_size / cjk_cached.units_per_em;
-                                        let cjk_transform = combined_base
-                                            .pre_translate(
-                                                (x_cursor + x_offset) * h_scale,
-                                                y_offset + gs.text_rise,
-                                            )
-                                            .pre_scale(cjk_scale, cjk_scale);
-                                        pixmap.fill_path(
-                                            &cjk_path,
-                                            paint,
-                                            tiny_skia::FillRule::EvenOdd,
-                                            cjk_transform,
-                                            clip_mask,
-                                        );
-                                        if let Some((sp, stroke)) = stroke_info {
-                                            pixmap.stroke_path(
-                                                &cjk_path, sp, stroke, cjk_transform, clip_mask,
-                                            );
-                                        }
-                                        has_outline = true;
-
-                                        // Vertical writing: use fallback font's vertical advance
-                                        // (PDF /W2 metrics are rarely declared; horizontal
-                                        // advance from /W is unreliable for vertical layout).
-                                        // Horizontal writing: keep PDF-declared advance (MuPDF).
-                                        if wmode == 1 {
-                                            let adv_src = cjk_cached
-                                                .ttf_face
-                                                .glyph_ver_advance(cjk_glyph_id)
-                                                .or_else(|| {
-                                                    cjk_cached
-                                                        .ttf_face
-                                                        .glyph_hor_advance(cjk_glyph_id)
-                                                });
-                                            if let Some(adv) = adv_src {
-                                                x_advance_override = Some(
-                                                    adv as f32 / cjk_cached.units_per_em
-                                                        * font_size,
-                                                );
-                                            }
-                                        }
+                                        let (cv_shift_x, cv_shift_y) = if wmode == 1 { (-500.0 * cjk_scale, -880.0 * cjk_scale) } else { (0.0, 0.0) };
+                                        let t_cjk = combined_base.pre_translate((x_cursor + p.x_offset as f32 / units_per_em * font_size + cv_shift_x) * h_scale, y_cursor + p.y_offset as f32 / units_per_em * font_size + cv_shift_y + gs.text_rise).pre_scale(cjk_scale, cjk_scale);
+                                        pixmap.fill_path(&cjk_path, paint, tiny_skia::FillRule::EvenOdd, t_cjk, clip_mask);
+                                        if let Some((sp, stroke)) = stroke_info { pixmap.stroke_path(&cjk_path, sp, stroke, t_cjk, clip_mask); }
                                     }
                                 }
                             }
                         }
                     }
                 }
-
-                if !has_outline {
-                    log::debug!(
-                        "No glyph outline found for char='{}' (0x{:X})",
-                        char_at_pos,
-                        char_at_pos as u32
-                    );
-                }
             }
 
-            // Advance cursor in text space
-            // PDF spec: tx = ((w0 * Tfs) + Tc + Tw) * Th
-            // Note: x_advance already includes w0 * Tfs
-            x_cursor += x_advance_override.unwrap_or(x_advance);
-
-            // Add character spacing (Tc)
-            x_cursor += gs.char_space;
-
-            if char_at_pos == ' ' {
-                // Add word spacing (Tw) for space characters
-                x_cursor += gs.word_space;
-            }
+            let advance = x_advance_override.unwrap_or_else(|| p.x_advance as f32 / units_per_em * font_size);
+            if wmode == 1 { y_cursor -= advance; y_cursor -= gs.char_space; } else { x_cursor += advance; x_cursor += gs.char_space; }
         }
-
-        Ok(x_cursor)
+        Ok(if wmode == 1 { -y_cursor } else { x_cursor })
     }
+
     /// Render text using direct CID-to-GID mapping, bypassing rustybuzz shaping.
     /// Used for CID subset fonts that have embedded data but no usable Unicode cmap.
     /// Per PDF spec section 9.7.4, CIDToGIDMap maps CIDs to glyph indices in the TrueType font.
@@ -1541,6 +1288,8 @@ impl TextRasterizer {
         let combined_base = base_transform.pre_concat(text_transform);
 
         let mut x_cursor: f32 = 0.0;
+        let mut y_cursor: f32 = 0.0;
+        let wmode = font_info.wmode;
 
         // Iterate over character codes from the raw bytes
         for (char_code, _bytes_consumed) in TextCharIter::new(bytes, Some(font_info)) {
@@ -1582,6 +1331,16 @@ impl TextRasterizer {
             // Draw glyph outline
             let mut rendered = false;
             if !char_at_pos.is_whitespace() {
+                // Vertical writing origin shift:
+                // In PDF vertical mode (WMode=1), the origin is at the top-center.
+                // Standard CID fonts use (w0/2, 880) as the vertical origin relative to horizontal origin.
+                // We shift the glyph left and down to align its vertical origin with the current point.
+                let (v_shift_x, v_shift_y) = if wmode == 1 {
+                    (-500.0 * scale, -880.0 * scale)
+                } else {
+                    (0.0, 0.0)
+                };
+
                 if gid != 0 {
                     let mut pb = PathBuilder::new();
                     let mut builder = SkiaOutlineBuilder(&mut pb);
@@ -1591,7 +1350,7 @@ impl TextRasterizer {
                     {
                         if let Some(path) = pb.finish() {
                             let glyph_transform = combined_base
-                                .pre_translate(x_cursor * h_scale, gs.text_rise)
+                                .pre_translate((x_cursor + v_shift_x) * h_scale, y_cursor + v_shift_y + gs.text_rise)
                                 .pre_scale(scale, scale);
                             pixmap.fill_path(
                                 &path,
@@ -1609,9 +1368,6 @@ impl TextRasterizer {
                 }
 
                 // Per-glyph system font fallback when embedded font lacks the glyph.
-                // This mirrors MuPDF's multi-stage fallback strategy: when the primary
-                // font returns GID=0 (or has no outline), try Latin then CJK system
-                // fonts before giving up.
                 if !rendered && char_at_pos != '\0' {
                     // Stage 1: Latin / general fallback
                     if let Some((lat_id, lat_arc, lat_idx)) =
@@ -1628,8 +1384,13 @@ impl TextRasterizer {
                                 {
                                     if let Some(lat_path) = lat_pb.finish() {
                                         let lat_scale = font_size / lat_cached.units_per_em;
+                                        let (v_shift_x, v_shift_y) = if wmode == 1 {
+                                            (-500.0 * lat_scale, -880.0 * lat_scale)
+                                        } else {
+                                            (0.0, 0.0)
+                                        };
                                         let glyph_transform = combined_base
-                                            .pre_translate(x_cursor * h_scale, gs.text_rise)
+                                            .pre_translate((x_cursor + v_shift_x) * h_scale, y_cursor + v_shift_y + gs.text_rise)
                                             .pre_scale(lat_scale, lat_scale);
                                         pixmap.fill_path(
                                             &lat_path,
@@ -1669,10 +1430,15 @@ impl TextRasterizer {
                                         if let Some(cjk_path) = cjk_pb.finish() {
                                             let cjk_scale =
                                                 font_size / cjk_cached.units_per_em;
+                                            let (v_shift_x, v_shift_y) = if wmode == 1 {
+                                                (-500.0 * cjk_scale, -880.0 * cjk_scale)
+                                            } else {
+                                                (0.0, 0.0)
+                                            };
                                             let glyph_transform = combined_base
                                                 .pre_translate(
-                                                    x_cursor * h_scale,
-                                                    gs.text_rise,
+                                                    (x_cursor + v_shift_x) * h_scale,
+                                                    y_cursor + v_shift_y + gs.text_rise,
                                                 )
                                                 .pre_scale(cjk_scale, cjk_scale);
                                             pixmap.fill_path(
@@ -1711,14 +1477,22 @@ impl TextRasterizer {
                 }
             }
 
-            x_cursor += x_advance;
-            x_cursor += gs.char_space;
-            if char_at_pos == ' ' {
-                x_cursor += gs.word_space;
+            if wmode == 1 {
+                y_cursor -= x_advance;
+                y_cursor -= gs.char_space;
+                if char_at_pos == ' ' {
+                    y_cursor -= gs.word_space;
+                }
+            } else {
+                x_cursor += x_advance;
+                x_cursor += gs.char_space;
+                if char_at_pos == ' ' {
+                    x_cursor += gs.word_space;
+                }
             }
         }
 
-        Ok(x_cursor)
+        Ok(if wmode == 1 { -y_cursor } else { x_cursor })
     }
 
     /// Fallback simple rendering if no font found.
