@@ -405,8 +405,38 @@ impl PdfImage {
                     jpeg_data.len(),
                     &jpeg_data[..min(jpeg_data.len(), 16)]
                 );
-                image::load_from_memory(jpeg_data)
-                    .map_err(|e| Error::Decode(format!("Failed to decode JPEG: {}", e)))
+                
+                // Attempt ultra-fast decoding via zune-jpeg
+                let fast_res = (|| -> std::result::Result<image::DynamicImage, Box<dyn std::error::Error>> {
+                    let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg_data));
+                    let pixels = decoder.decode()?;
+                    let w = self.width;
+                    let h = self.height;
+                    
+                    if pixels.len() == (w * h * 3) as usize {
+                        let buf = image::ImageBuffer::from_raw(w, h, pixels)
+                            .ok_or("Invalid RGB buffer dimensions")?;
+                        Ok(image::DynamicImage::ImageRgb8(buf))
+                    } else if pixels.len() == (w * h) as usize {
+                        let buf = image::ImageBuffer::from_raw(w, h, pixels)
+                            .ok_or("Invalid grayscale buffer dimensions")?;
+                        Ok(image::DynamicImage::ImageLuma8(buf))
+                    } else {
+                        Err("Unsupported component count for fast path".into())
+                    }
+                })();
+
+                match fast_res {
+                    Ok(img) => {
+                        log::debug!("Successfully decoded JPEG using zune-jpeg fast path");
+                        Ok(img)
+                    }
+                    Err(e) => {
+                        log::debug!("zune-jpeg decoding fallback: {}, using standard decoder", e);
+                        image::load_from_memory(jpeg_data)
+                            .map_err(|err| Error::Decode(format!("Failed to decode JPEG: {}", err)))
+                    }
+                }
             },
             ImageData::Raw { pixels, format } => {
                 if self.bits_per_component == 1
@@ -477,6 +507,7 @@ impl PdfImage {
         }
     }
 }
+
 
 /// Image data representation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

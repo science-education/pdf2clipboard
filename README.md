@@ -59,6 +59,7 @@ trunk serve
 - **CFF サブセットの CID→GID マップ**: CIDFontType0 (CFF) サブセットフォントでは、グリフは GID 順に格納される一方、CID は CFF の `charset` テーブルによって定義されます。PDF側の CID を直接 GID として渡すと誤った文字が描画されるため、内部で `charset` テーブルをパースして正確な対応表を動的構築しています。
 - **OpenType ラッパーの maxp.numGlyphs 拡張**: 生 CFF データを OpenType 形式にラップする際、ヘッダーの `maxp.numGlyphs` を `0xFFFF` に拡張設定しています。標準の256グリフ上限のままだと、数千文字に及ぶ日本語グリフが大半範囲外と判定されパーサーに拒否される問題を回避しています。
 - **`re` オペレータの巻数方向の保持**: PDF仕様（§8.5.2.1）に準拠し、`x y w h re` 命令を展開する際、幅・高さの正負によるパスの描画方向（時計回り/反時計回り）を維持したままサブパス化します。これにより非ゼロ巻数則（`f` オペレータ）が正しく適用され、ロゴ文字等の複雑な白抜き部分を正確にくり抜きます。
+- **JPEGデコードの超高速化 (`zune-jpeg`)**: 巨大なスキャンPDFのサムネイル生成時のボトルネックを解消するため、純粋なRust実装として最高速のデコーダである `zune-jpeg` を採用。SIMD命令を活用した高速展開と効率的なメモリ管理により、従来の標準デコーダと比較して描画レイテンシを大幅に短縮しました。
 - **Wasmターゲット向け並列処理の分離**: `#[cfg(target_arch = "wasm32")]` アトリビュートを適用し、ブラウザ環境で制約となる `rayon` 依存コードやファイルシステムアクセスを完全に切り離した単一スレッド用のクリーンなパイプラインを確立しています。
 
 ## 依存主要クレート
@@ -67,6 +68,7 @@ trunk serve
 |---------|-----------|
 | [eframe](https://github.com/emilk/egui) / [egui](https://github.com/emilk/egui) | クロスプラットフォーム対応GUIフレームワーク |
 | pdf_oxide (ローカルフォーク) | 高品位PDF構造解析・ベクターラスタイザ |
+| [zune-jpeg](https://github.com/fujiapple852/zune-jpeg) | SIMDを活用した純Rust製の超高速JPEGデコーダ |
 | [windows](https://github.com/microsoft/windows-rs) | Win32 APIを介したネイティブクリップボード連携（Windows限定） |
 | [wasm-bindgen](https://rustwasm.github.io/) / [web-sys](https://rustwasm.github.io/) | WebAssemblyブラウザAPI・DOM・Canvas連携（Wasm限定） |
 

@@ -2151,6 +2151,7 @@ dependencies = [
  "unicode-linebreak",
  "uuid",
  "weezl",
+ "zune-jpeg",
 ]
 
 [[package]]
