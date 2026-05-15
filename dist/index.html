@@ -19,14 +19,96 @@
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="/pdf-page-copier-49e7e71daa726a74.js" crossorigin="anonymous" integrity="sha384-ps7n4YkJkvY/kWf6EZoRx/A5XDvaTBwqs2n45dsP+zq60THOvJa4bT71KjWfXAyF"><link rel="preload" href="/pdf-page-copier-49e7e71daa726a74_bg.wasm" crossorigin="anonymous" integrity="sha384-r9uMVUruUW+gGE5raZFEFxV6gO9zZA1hcqU4zSPQmVpD5RJtSH2al1NUheAK2uw1" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pdf2clipboard-6afece27a95138db.js" crossorigin="anonymous" integrity="sha384-ENJMh4REzoU6ZgXSCYjnYeJddG0Kc7FTt9gWZAMStwaNhKXqD3ZIklebM/Z+aCIQ"><link rel="preload" href="/pdf2clipboard-6afece27a95138db_bg.wasm" crossorigin="anonymous" integrity="sha384-axrQHezvjLnK5Ys28mg1m338xRBEryYGcyDVlA5Yr7CBGfWNXw7pY32HXsss/JN3" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
+    
+    <!-- PDF.js library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        const pdfjsLib = window['pdfjs-dist/build/pdf'];
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        let cachedPdfDoc = null;
+        let cachedPdfData = null;
+
+        async function get_doc(pdf_data) {
+            // If it's the same data, return cached doc
+            if (cachedPdfDoc && cachedPdfData === pdf_data) {
+                return cachedPdfDoc;
+            }
+            const loadingTask = pdfjsLib.getDocument({data: pdf_data});
+            cachedPdfDoc = await loadingTask.promise;
+            cachedPdfData = pdf_data;
+            return cachedPdfDoc;
+        }
+
+        async function render_pdf_page_js(pdf_data, page_num, dpi) {
+            try {
+                const pdf = await get_doc(pdf_data);
+                const page = await pdf.getPage(page_num + 1);
+                
+                // Calculate scale based on DPI (Standard PDF is 72 DPI)
+                const scale = dpi / 72.0;
+                const viewport = page.getViewport({ scale });
+                
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                canvas.width = Math.floor(viewport.width);
+                canvas.height = Math.floor(viewport.height);
+                
+                const renderContext = {
+                    canvasContext: context,
+                    viewport: viewport
+                };
+                await page.render(renderContext).promise;
+                
+                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                return {
+                    width: canvas.width,
+                    height: canvas.height,
+                    data: new Uint8Array(imageData.data.buffer)
+                };
+            } catch (e) {
+                console.error("PDF.js Render Error:", e);
+                throw e;
+            }
+        }
+
+        async function get_pdf_info_js(pdf_data) {
+            try {
+                const pdf = await get_doc(pdf_data);
+                const numPages = pdf.numPages;
+                
+                // Sample first 10 pages for aspect ratio to be fast, or all if small
+                let totalAspect = 0;
+                let count = 0;
+                const sampleLimit = Math.min(numPages, 10); 
+                for (let i = 1; i <= sampleLimit; i++) {
+                    const page = await pdf.getPage(i);
+                    const vp = page.getViewport({scale: 1.0});
+                    totalAspect += vp.width / vp.height;
+                    count++;
+                }
+                
+                return {
+                    numPages: numPages,
+                    avgAspect: count > 0 ? totalAspect / count : 0.707
+                };
+            } catch (e) {
+                console.error("PDF.js Info Error:", e);
+                throw e;
+            }
+        }
+
+        window.render_pdf_page_js = render_pdf_page_js;
+        window.get_pdf_info_js = get_pdf_info_js;
+    </script>
     <!-- Trunk will inject the wasm glue script here -->
 
 <script type="module">
-import init, * as bindings from '/pdf-page-copier-49e7e71daa726a74.js';
-const wasm = await init({ module_or_path: '/pdf-page-copier-49e7e71daa726a74_bg.wasm' });
+import init, * as bindings from '/pdf2clipboard-6afece27a95138db.js';
+const wasm = await init({ module_or_path: '/pdf2clipboard-6afece27a95138db_bg.wasm' });
 
 
 window.wasmBindings = bindings;

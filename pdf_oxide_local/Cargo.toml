@@ -607,6 +607,9 @@ default-features = false
 [dependencies.zune-jpeg]
 version = "0.5"
 
+[dependencies.zune-core]
+version = "0.5"
+
 [dev-dependencies.crc32fast]
 version = "1.3"
 

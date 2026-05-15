@@ -1,10 +1,10 @@
 [package]
-name = "pdf-page-copier"
+name = "pdf2clipboard"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "PDFPageCopier"
+name = "PDFPageToClipboard"
 path = "src/main.rs"
 
 [dependencies]
@@ -12,6 +12,8 @@ eframe = { version = "0.29", default-features = false, features = ["glow", "defa
 egui = "0.29"
 pdf_oxide = { path = "./pdf_oxide_local", features = ["rendering", "parallel"] }
 log = "0.4"
+rayon = "1.10"
+sys-locale = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.61"
@@ -33,8 +35,8 @@ poll-promise = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 
 [profile.release]
-opt-level = "z"
-lto      = true
-codegen-units = 1
+opt-level = 3
+lto      = "thin"
+codegen-units = 16
 strip    = true
 panic    = "abort"

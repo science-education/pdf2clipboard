@@ -408,7 +408,14 @@ impl PdfImage {
                 
                 // Attempt ultra-fast decoding via zune-jpeg
                 let fast_res = (|| -> std::result::Result<image::DynamicImage, Box<dyn std::error::Error>> {
-                    let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg_data));
+                    use zune_core::colorspace::ColorSpace;
+                    use zune_core::options::DecoderOptions;
+
+                    // Request RGB output (handles CMYK -> RGB conversion internally)
+                    let options = DecoderOptions::default()
+                        .jpeg_set_out_colorspace(ColorSpace::RGB);
+                    
+                    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(jpeg_data), options);
                     let pixels = decoder.decode()?;
                     let w = self.width;
                     let h = self.height;
@@ -422,7 +429,7 @@ impl PdfImage {
                             .ok_or("Invalid grayscale buffer dimensions")?;
                         Ok(image::DynamicImage::ImageLuma8(buf))
                     } else {
-                        Err("Unsupported component count for fast path".into())
+                        Err(format!("Unsupported output size: {} (expected {} or {})", pixels.len(), w*h*3, w*h).into())
                     }
                 })();
 
