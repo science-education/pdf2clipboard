@@ -1,28 +1,17 @@
 #![windows_subsystem = "windows"]
 
+mod platform;
+
 use eframe::egui::{self, ColorImage, ScrollArea, TextureHandle, TextureOptions};
+#[cfg(target_arch = "wasm32")]
+use pdf_oxide::document::PdfDocument;
 #[cfg(not(target_arch = "wasm32"))]
 use pdf_oxide::{
     document::PdfDocument,
     rendering::{render_page, render_page_fit, RenderOptions},
 };
-#[cfg(target_arch = "wasm32")]
-use pdf_oxide::document::PdfDocument;
-use std::sync::{
-    atomic::AtomicU32,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-
-#[cfg(windows)]
-use windows::Win32::{
-    Graphics::Gdi::BI_RGB,
-    System::{
-        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
-    },
-};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -39,13 +28,24 @@ extern "C" {
 
 #[cfg(target_arch = "wasm32")]
 fn parse_js_image(val: JsValue) -> Result<ColorImage, String> {
-    let width = js_sys::Reflect::get(&val, &"width".into()).map_err(|e| format!("{:?}", e))?.as_f64().ok_or("no width")? as usize;
-    let height = js_sys::Reflect::get(&val, &"height".into()).map_err(|e| format!("{:?}", e))?.as_f64().ok_or("no height")? as usize;
+    let width = js_sys::Reflect::get(&val, &"width".into())
+        .map_err(|e| format!("{:?}", e))?
+        .as_f64()
+        .ok_or("no width")? as usize;
+    let height = js_sys::Reflect::get(&val, &"height".into())
+        .map_err(|e| format!("{:?}", e))?
+        .as_f64()
+        .ok_or("no height")? as usize;
     let data = js_sys::Reflect::get(&val, &"data".into()).map_err(|e| format!("{:?}", e))?;
     let uint8_data = js_sys::Uint8Array::new(&data);
-    let mut pixels = vec![egui::Color32::from_rgba_unmultiplied(0,0,0,0); width * height];
-    uint8_data.copy_to(unsafe { std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixels.len() * 4) });
-    Ok(ColorImage { size: [width, height], pixels })
+    let mut pixels = vec![egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0); width * height];
+    uint8_data.copy_to(unsafe {
+        std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixels.len() * 4)
+    });
+    Ok(ColorImage {
+        size: [width, height],
+        pixels,
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -77,7 +77,7 @@ impl Tr {
         }
         &TR_EN
     }
-    
+
     #[allow(dead_code)]
     fn status_not_yet(&self, p: usize) -> String {
         if self.is_jp {
@@ -124,35 +124,85 @@ enum CopyState {
 }
 
 struct PageSlot {
-    tex:         Option<TextureHandle>,
-    img:         Option<ColorImage>,
+    tex: Option<TextureHandle>,
+    img: Option<ColorImage>,
     is_full_res: bool,
-    copy_state:  CopyState,
+    copy_state: CopyState,
+    render_error: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LoadedPdf {
+    bytes: Arc<[u8]>,
+    name: String,
+    page_count: u32,
+    aspect: f32,
+}
+
+enum AppMsg {
+    Rendered {
+        render_gen: u32,
+        page: usize,
+        img: ColorImage,
+        is_full_res: bool,
+    },
+    RenderFailed {
+        render_gen: u32,
+        page: usize,
+        error: String,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    Loaded {
+        doc_gen: u32,
+        result: Result<LoadedPdf, String>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    PdfInfo {
+        doc_gen: u32,
+        page_count: u32,
+        aspect: f32,
+    },
+}
+
+enum CopyMsg {
+    Done {
+        doc_gen: u32,
+        copy_gen: u32,
+        page: usize,
+    },
+    Failed {
+        doc_gen: u32,
+        copy_gen: u32,
+        page: usize,
+        error: String,
+    },
 }
 
 struct App {
-    pdf_bytes:       Option<Arc<[u8]>>,
+    pdf_bytes: Option<Arc<[u8]>>,
+    copied_page: Option<usize>,
+    selected_page: Option<usize>,
+    page_count: u32,
+    pages: Vec<PageSlot>,
+    thumb_size: u32,
+    page_aspect: f32,
+    dpi: f32,
+    status: String,
+    tr: &'static Tr,
+    tx: mpsc::Sender<AppMsg>,
+    rx: Arc<Mutex<mpsc::Receiver<AppMsg>>>,
     #[allow(dead_code)]
-    cached_doc:      Option<PdfDocument>,
-    copied_page:     Option<usize>,
-    selected_page:   Option<usize>,
-    page_count:      u32,
-    pages:           Vec<PageSlot>,
-    thumb_size:      u32,
-    page_aspect:     f32,
-    dpi:             f32,
-    status:          String,
-    tr:              &'static Tr,
-    tx:              mpsc::Sender<(usize, ColorImage, bool)>,
-    rx:              Arc<Mutex<mpsc::Receiver<(usize, ColorImage, bool)>>>,
+    copy_tx: mpsc::Sender<CopyMsg>,
     #[allow(dead_code)]
-    copy_tx:         mpsc::Sender<usize>,
+    copy_rx: Arc<Mutex<mpsc::Receiver<CopyMsg>>>,
     #[allow(dead_code)]
-    copy_rx:         Arc<Mutex<mpsc::Receiver<usize>>>,
+    render_gen: Arc<AtomicU32>,
     #[allow(dead_code)]
-    render_gen:      Arc<AtomicU32>,
+    doc_gen: Arc<AtomicU32>,
     #[allow(dead_code)]
-    egui_ctx:        egui::Context,
+    copy_gen: Arc<AtomicU32>,
+    #[allow(dead_code)]
+    egui_ctx: egui::Context,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -160,10 +210,47 @@ fn build_doc(bytes: &[u8]) -> Result<PdfDocument, String> {
     PdfDocument::from_bytes(bytes.to_vec()).map_err(|e| e.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn load_pdf_in_background(bytes: Arc<[u8]>, name: String) -> Result<LoadedPdf, String> {
+    eprintln!("Starting build_doc...");
+    let doc = build_doc(&bytes)?;
+    eprintln!("build_doc success, getting page count...");
+    let page_count = doc.page_count().map_err(|e| e.to_string())? as u32;
+    eprintln!("Page count: {}", page_count);
+
+    let mut total_aspect = 0.0f32;
+    let mut count = 0u32;
+    for i in 0..page_count as usize {
+        if let Ok(info) = doc.get_page_info(i) {
+            let (pw, ph) = if info.rotation == 90 || info.rotation == 270 {
+                (info.media_box.height, info.media_box.width)
+            } else {
+                (info.media_box.width, info.media_box.height)
+            };
+            if ph > 0.0 {
+                total_aspect += pw / ph;
+                count += 1;
+            }
+        }
+    }
+    let aspect = if count > 0 {
+        total_aspect / count as f32
+    } else {
+        0.707
+    };
+
+    Ok(LoadedPdf {
+        bytes,
+        name,
+        page_count,
+        aspect,
+    })
+}
+
 fn setup_fonts(ctx: &egui::Context) {
     #[allow(unused_mut)]
     let mut fonts = egui::FontDefinitions::default();
-    
+
     #[cfg(windows)]
     for path in &[
         "C:/Windows/Fonts/meiryo.ttc",
@@ -172,7 +259,9 @@ fn setup_fonts(ctx: &egui::Context) {
         "C:/Windows/Fonts/YuGothM.ttc",
     ] {
         if let Ok(data) = std::fs::read(path) {
-            fonts.font_data.insert("jp".to_owned(), egui::FontData::from_owned(data));
+            fonts
+                .font_data
+                .insert("jp".to_owned(), egui::FontData::from_owned(data));
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 if let Some(v) = fonts.families.get_mut(&family) {
                     v.insert(0, "jp".to_owned());
@@ -182,12 +271,43 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let mut loaded = false;
+        for path in &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Hiragino Sans GB W3.otf",
+            "/System/Library/Fonts/Supplemental/Hiragino Sans GB W6.otf",
+            "/Library/Fonts/Hiragino Sans W3.ttc",
+        ] {
+            if let Ok(data) = std::fs::read(path) {
+                eprintln!("Loaded Japanese font from: {}", path);
+                fonts
+                    .font_data
+                    .insert("jp".to_owned(), egui::FontData::from_owned(data));
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    if let Some(v) = fonts.families.get_mut(&family) {
+                        v.insert(0, "jp".to_owned());
+                    }
+                }
+                loaded = true;
+                break;
+            }
+        }
+        if !loaded {
+            eprintln!("Warning: No Japanese fonts found on macOS at expected locations.");
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     {
         // On Web, we can't access local system fonts.
         // The user should bundle a font or we use the default.
         // For demonstration, we could use include_bytes! here if a font was available.
-        log::warn!("Japanese fonts are not bundled for Web. CJK text may not render correctly in UI.");
+        log::warn!(
+            "Japanese fonts are not bundled for Web. CJK text may not render correctly in UI."
+        );
     }
 
     ctx.set_fonts(fonts);
@@ -201,7 +321,6 @@ impl App {
         let (copy_tx, copy_rx) = mpsc::channel();
         Self {
             pdf_bytes: None,
-            cached_doc: None,
             copied_page: None,
             selected_page: None,
             page_count: 0,
@@ -216,88 +335,92 @@ impl App {
             copy_tx,
             copy_rx: Arc::new(Mutex::new(copy_rx)),
             render_gen: Arc::new(AtomicU32::new(0)),
+            doc_gen: Arc::new(AtomicU32::new(0)),
+            copy_gen: Arc::new(AtomicU32::new(0)),
             egui_ctx: cc.egui_ctx.clone(),
         }
     }
 
-    fn load_pdf_path(&mut self, path: &str) {
-        let _ = path;
+    fn load_pdf_path(&mut self, path: &std::path::Path) {
+        eprintln!("Loading PDF path: {:?}", path);
+        let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        self.render_gen.fetch_add(1, Ordering::Relaxed);
+        self.copy_gen.fetch_add(1, Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            match std::fs::read(path) {
-                Ok(data) => self.load_pdf_bytes(data.into(), Some(path)),
-                Err(e) => self.status = format!("Error: {e}"),
+            let tx = self.tx.clone();
+            let ctx = self.egui_ctx.clone();
+            let path = path.to_owned();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("PDF")
+                .to_owned();
+            self.status = format!("Loading {name}...");
+            let spawn_res = std::thread::Builder::new()
+                .name("pdf-loader".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let res = match std::fs::read(&path) {
+                        Ok(data) => {
+                            eprintln!("File read success: {} bytes", data.len());
+                            load_pdf_in_background(data.into(), name)
+                        }
+                        Err(e) => {
+                            eprintln!("File read error for {:?}: {}", path, e);
+                            Err(format!("Error: {e}"))
+                        }
+                    };
+                    let _ = tx.send(AppMsg::Loaded {
+                        doc_gen,
+                        result: res,
+                    });
+                    ctx.request_repaint();
+                });
+            if let Err(e) = spawn_res {
+                self.status = format!("Error: {e}");
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
-             self.status = "Direct file path access is not supported on Web. Use drag-and-drop.".into();
+            let _ = path;
+            self.status =
+                "Direct file path access is not supported on Web. Use drag-and-drop.".into();
         }
     }
 
     fn load_pdf_bytes(&mut self, bytes: Arc<[u8]>, name: Option<&str>) {
-        match self.do_load(bytes) {
-            Ok(n) => {
-                let display_name = name.map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p)).unwrap_or("PDF");
-                self.status = format!("{display_name}{}", (self.tr.pages_count)(n));
-                self.selected_page = Some(0);
-            }
-            Err(e) => self.status = format!("Error: {e}"),
-        }
+        eprintln!("Loading PDF bytes: {} bytes", bytes.len());
+        let display_name = name
+            .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p))
+            .unwrap_or("PDF")
+            .to_owned();
+        self.status = format!("Loading {display_name}...");
+        self.do_load(bytes, display_name);
     }
 
-    fn do_load(&mut self, bytes: Arc<[u8]>) -> Result<u32, String> {
+    fn do_load(&mut self, bytes: Arc<[u8]>, name: String) {
+        let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        self.render_gen.fetch_add(1, Ordering::Relaxed);
+        self.copy_gen.fetch_add(1, Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let (tx_load, rx_load) = std::sync::mpsc::channel();
-            let bytes_for_thread = Arc::clone(&bytes);
-            
-            let _ = std::thread::Builder::new()
+            let tx = self.tx.clone();
+            let ctx = self.egui_ctx.clone();
+
+            let spawn_res = std::thread::Builder::new()
                 .name("pdf-loader".into())
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
-                    let res = (|| -> Result<(u32, f32, PdfDocument), String> {
-                        let doc = build_doc(&bytes_for_thread)?;
-                        let n = doc.page_count().map_err(|e| e.to_string())? as u32;
-
-                        let mut total_aspect = 0.0f32;
-                        let mut count = 0u32;
-                        for i in 0..n as usize {
-                            if let Ok(info) = doc.get_page_info(i) {
-                                let (pw, ph) = if info.rotation == 90 || info.rotation == 270 {
-                                    (info.media_box.height, info.media_box.width)
-                                } else {
-                                    (info.media_box.width, info.media_box.height)
-                                };
-                                if ph > 0.0 {
-                                    total_aspect += pw / ph;
-                                    count += 1;
-                                }
-                            }
-                        }
-                        let aspect = if count > 0 { total_aspect / count as f32 } else { 0.707 };
-                        Ok((n, aspect, doc))
-                    })();
-                    let _ = tx_load.send(res);
+                    let res = load_pdf_in_background(bytes, name);
+                    let _ = tx.send(AppMsg::Loaded {
+                        doc_gen,
+                        result: res,
+                    });
+                    ctx.request_repaint();
                 });
-
-            match rx_load.recv().unwrap_or(Err("Loader thread died".into())) {
-                Ok((n, aspect, doc)) => {
-                    self.page_aspect = aspect;
-                    self.page_count = n;
-                    self.cached_doc = Some(doc);
-                    self.copied_page = None;
-                    self.pages = (0..n).map(|_| PageSlot { 
-                        tex: None, 
-                        img: None, 
-                        is_full_res: false,
-                        copy_state: CopyState::Idle,
-                    }).collect();
-                    self.pdf_bytes = Some(bytes);
-                    self.spawn_render(n, self.thumb_size);
-                    Ok(n)
-                }
-                Err(e) => Err(e),
+            if let Err(e) = spawn_res {
+                self.status = format!("Error: {e}");
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -305,18 +428,26 @@ impl App {
             let ctx = self.egui_ctx.clone();
             let tx = self.tx.clone();
             let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-            
+
             wasm_bindgen_futures::spawn_local(async move {
                 let res = get_pdf_info_js(bytes_js).await;
-                let n = js_sys::Reflect::get(&res, &"numPages".into()).unwrap().as_f64().unwrap_or(0.0) as u32;
-                let aspect = js_sys::Reflect::get(&res, &"avgAspect".into()).unwrap().as_f64().unwrap_or(0.707) as f32;
-                
-                // Use page_num = usize::MAX as a signal for PDF info
-                let _ = tx.send((usize::MAX, egui::ColorImage::new([n as usize, (aspect * 1000.0) as usize], egui::Color32::TRANSPARENT), false));
+                let n = js_sys::Reflect::get(&res, &"numPages".into())
+                    .unwrap()
+                    .as_f64()
+                    .unwrap_or(0.0) as u32;
+                let aspect = js_sys::Reflect::get(&res, &"avgAspect".into())
+                    .unwrap()
+                    .as_f64()
+                    .unwrap_or(0.707) as f32;
+
+                let _ = tx.send(AppMsg::PdfInfo {
+                    doc_gen,
+                    page_count: n,
+                    aspect,
+                });
                 ctx.request_repaint();
             });
             self.pdf_bytes = Some(bytes);
-            Ok(0) 
         }
     }
 
@@ -324,47 +455,84 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let bytes = match &self.pdf_bytes {
-                Some(b) => Arc::clone(b),
+                Some(bytes) => Arc::clone(bytes),
                 None => return,
             };
             let page_count = _page_count;
+            let thumb_size = _thumb_size;
 
-            let gen         = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let gen = self.render_gen.fetch_add(1, Ordering::Relaxed) + 1;
             // Receive rendered images
-            let render_gen  = Arc::clone(&self.render_gen);
-            let tx          = self.tx.clone();
-            let next_page   = Arc::new(Mutex::new(0u32));
-            for _i in 0..4 {
-                let bytes     = Arc::clone(&bytes);
-                let tx        = tx.clone();
+            let render_gen = Arc::clone(&self.render_gen);
+            let tx = self.tx.clone();
+            let next_page = Arc::new(Mutex::new(0u32));
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .saturating_sub(1)
+                .clamp(2, 4);
+            for _i in 0..n_threads {
+                let bytes = Arc::clone(&bytes);
+                let tx = tx.clone();
                 let next_page = Arc::clone(&next_page);
-                let rgen      = Arc::clone(&render_gen);
+                let rgen = Arc::clone(&render_gen);
 
                 let builder = std::thread::Builder::new()
                     .name(format!("render-{}", _i))
                     .stack_size(16 * 1024 * 1024); // 16MB stack
 
                 let _ = builder.spawn(move || {
-                let doc = match build_doc(&bytes) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                };
-
-                // Pass 1: Quick thumbnails (36 DPI) - updates UI
-                loop {
-                    if rgen.load(Ordering::Relaxed) != gen { return; }
-                    let i = {
-                        let mut guard = next_page.lock().unwrap();
-                        if *guard >= page_count { break; }
-                        let i = *guard;
-                        *guard += 1;
-                        i
+                    let doc = match build_doc(&bytes) {
+                        Ok(doc) => doc,
+                        Err(e) => {
+                            eprintln!("Failed to build PDF document in render thread: {e}");
+                            return;
+                        }
                     };
-                    if let Ok(img) = pdf_render(&doc, i as usize, 0.0, Some(36.0)) {
-                        if tx.send((i as usize, img, false)).is_err() { return; }
-                    }
-                }
 
+                    // Render thumbnails independently from copy DPI.
+                    loop {
+                        if rgen.load(Ordering::Relaxed) != gen {
+                            return;
+                        }
+                        let i = {
+                            let mut guard = next_page.lock().unwrap();
+                            if *guard >= page_count {
+                                break;
+                            }
+                            let i = *guard;
+                            *guard += 1;
+                            i
+                        };
+                        match pdf_render(&doc, i as usize, thumb_size as f32, None) {
+                            Ok(img) => {
+                                if tx
+                                    .send(AppMsg::Rendered {
+                                        render_gen: gen,
+                                        page: i as usize,
+                                        img,
+                                        is_full_res: false,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("Failed to render thumbnail page {}: {}", i + 1, error);
+                                if tx
+                                    .send(AppMsg::RenderFailed {
+                                        render_gen: gen,
+                                        page: i as usize,
+                                        error,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -381,8 +549,12 @@ impl App {
 
     fn copy_page(&mut self, ctx: &egui::Context, page_num: usize) {
         let _ = ctx;
-        if page_num >= self.pages.len() { return; }
-        
+        if page_num >= self.pages.len() {
+            return;
+        }
+        let doc_gen = self.doc_gen.load(Ordering::Relaxed);
+        let copy_gen = self.copy_gen.fetch_add(1, Ordering::Relaxed) + 1;
+
         // Reset Done state of previous pages
         for p in &mut self.pages {
             if p.copy_state == CopyState::Done {
@@ -393,9 +565,12 @@ impl App {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let bytes = match &self.pdf_bytes { Some(b) => Arc::clone(b), None => return };
+            let bytes = match &self.pdf_bytes {
+                Some(b) => Arc::clone(b),
+                None => return,
+            };
             let ctx = ctx.clone();
-            let tx = self.tx.clone(); // use regular tx to receive rendered image
+            let copy_tx = self.copy_tx.clone();
             let tr = self.tr;
             let page_num = page_num;
             let dpi = self.dpi;
@@ -404,11 +579,29 @@ impl App {
             wasm_bindgen_futures::spawn_local(async move {
                 let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
                 let res = render_pdf_page_js(bytes_js, page_num as u32, dpi).await;
-                if let Ok(img) = parse_js_image(res) {
-                    // Send with is_full_res=true so update() can handle clipboard
-                    let _ = tx.send((page_num, img, true));
-                    ctx.request_repaint();
-                }
+                let msg = match parse_js_image(res) {
+                    Ok(img) => match platform::clipboard_set_web(&img).await {
+                        Ok(()) => CopyMsg::Done {
+                            doc_gen,
+                            copy_gen,
+                            page: page_num,
+                        },
+                        Err(error) => CopyMsg::Failed {
+                            doc_gen,
+                            copy_gen,
+                            page: page_num,
+                            error,
+                        },
+                    },
+                    Err(error) => CopyMsg::Failed {
+                        doc_gen,
+                        copy_gen,
+                        page: page_num,
+                        error,
+                    },
+                };
+                let _ = copy_tx.send(msg);
+                ctx.request_repaint();
             });
             return;
         }
@@ -422,15 +615,25 @@ impl App {
                     let copy_tx = self.copy_tx.clone();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
-                        #[cfg(windows)]
-                        clipboard_set_windows(img_to_copy);
-                        let _ = copy_tx.send(page_num);
+                        let copy_res = platform::set_clipboard_image(img_to_copy);
+                        let msg = match copy_res {
+                            Ok(()) => CopyMsg::Done {
+                                doc_gen,
+                                copy_gen,
+                                page: page_num,
+                            },
+                            Err(error) => CopyMsg::Failed {
+                                doc_gen,
+                                copy_gen,
+                                page: page_num,
+                                error,
+                            },
+                        };
+                        let _ = copy_tx.send(msg);
                         ctx.request_repaint();
                     });
-                    
-                    self.pages[page_num].copy_state = CopyState::Done;
+
                     self.selected_page = Some(page_num);
-                    self.status = (self.tr.status_copy_done)(page_num + 1);
                     return;
                 }
             }
@@ -438,7 +641,7 @@ impl App {
             // Fallback: asynchronous render with large stack if cache is missing
             let dpi = self.dpi;
             let bytes = match &self.pdf_bytes {
-                Some(b) => Arc::clone(b),
+                Some(bytes) => Arc::clone(bytes),
                 None => return,
             };
 
@@ -446,7 +649,7 @@ impl App {
             let copy_tx = self.copy_tx.clone();
             let ctx = ctx.clone();
 
-            let _ = std::thread::Builder::new()
+            let spawn_res = std::thread::Builder::new()
                 .name(format!("copy-render-{}", page_num))
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
@@ -454,17 +657,41 @@ impl App {
                         let doc = build_doc(&bytes)?;
                         pdf_render(&doc, page_num, 0.0, Some(dpi))
                     })();
-                    
+
                     match res {
                         Ok(img) => {
-                            #[cfg(windows)]
-                            clipboard_set_windows(img);
-                            let _ = copy_tx.send(page_num);
+                            let copy_res = platform::set_clipboard_image(img);
+                            let msg = match copy_res {
+                                Ok(()) => CopyMsg::Done {
+                                    doc_gen,
+                                    copy_gen,
+                                    page: page_num,
+                                },
+                                Err(error) => CopyMsg::Failed {
+                                    doc_gen,
+                                    copy_gen,
+                                    page: page_num,
+                                    error,
+                                },
+                            };
+                            let _ = copy_tx.send(msg);
                             ctx.request_repaint();
                         }
-                        Err(_) => {}
+                        Err(error) => {
+                            let _ = copy_tx.send(CopyMsg::Failed {
+                                doc_gen,
+                                copy_gen,
+                                page: page_num,
+                                error,
+                            });
+                            ctx.request_repaint();
+                        }
                     }
                 });
+            if let Err(e) = spawn_res {
+                self.pages[page_num].copy_state = CopyState::Idle;
+                self.status = format!("Error: {e}");
+            }
         }
     }
 }
@@ -495,7 +722,9 @@ fn pdf_render(
     // tiny-skia outputs premultiplied RGBA. Un-premultiply to straight RGBA for egui.
     // For scanned PDFs with white background alpha is always 255, so this is fast.
     #[allow(unused_mut)]
-    let mut pixels: Vec<egui::Color32> = rendered.data.chunks_exact(4)
+    let mut pixels: Vec<egui::Color32> = rendered
+        .data
+        .chunks_exact(4)
         .map(|p| {
             let a = p[3];
             let (r, g, b) = if a == 0 {
@@ -514,115 +743,48 @@ fn pdf_render(
         })
         .collect();
 
-    Ok(ColorImage { size: [w, h], pixels })
+    // Fast sharpening for thumbnails. Copy rendering passes a DPI; thumbnails use fit size.
+    if dpi.is_none() {
+        sharpen_image(&mut pixels, w, h);
+    }
+
+    Ok(ColorImage {
+        size: [w, h],
+        pixels,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Clipboard  (CF_DIB / 24-bit BGR, bottom-up)
-// ---------------------------------------------------------------------------
-
-#[cfg(windows)]
-fn clipboard_set_windows(img: ColorImage) {
-    use rayon::prelude::*;
-    let w = img.size[0] as i32;
-    let h = img.size[1] as i32;
-    let row_stride = (w * 3 + 3) & !3_i32;
-
-    #[repr(C)]
-    struct BIH {
-        size: u32, width: i32, height: i32,
-        planes: u16, bit_count: u16,
-        compression: u32, size_image: u32,
-        x_pels: i32, y_pels: i32,
-        clr_used: u32, clr_important: u32,
+fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize) {
+    if w < 3 || h < 3 {
+        return;
     }
+    let original = pixels.to_vec();
+    // Simple 3x3 sharpening kernel:
+    // [ 0, -1,  0]
+    // [-1,  5, -1]
+    // [ 0, -1,  0]
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let idx = y * w + x;
+            let center = original[idx];
+            let top = original[(y - 1) * w + x];
+            let bottom = original[(y + 1) * w + x];
+            let left = original[y * w + x - 1];
+            let right = original[y * w + x + 1];
 
-    let bih_sz = std::mem::size_of::<BIH>();
-    let total  = bih_sz + (row_stride * h) as usize;
+            let sharpen = |c1: u8, c2: u8, c3: u8, c4: u8, c5: u8| -> u8 {
+                let val = 5 * (c1 as i32) - (c2 as i32) - (c3 as i32) - (c4 as i32) - (c5 as i32);
+                val.clamp(0, 255) as u8
+            };
 
-    // Prepare pixel data in parallel to avoid freezing UI
-    let mut pixel_data = vec![0u8; (row_stride * h) as usize];
-    pixel_data.par_chunks_exact_mut(row_stride as usize).enumerate().for_each(|(y, drow)| {
-        let src_y = h as usize - 1 - y;
-        let pixels = &img.pixels;
-        for x in 0..w as usize {
-            let c = pixels[src_y * w as usize + x];
-            drow[x * 3]     = c.b();
-            drow[x * 3 + 1] = c.g();
-            drow[x * 3 + 2] = c.r();
-        }
-    });
-
-    unsafe {
-        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total) else { return; };
-        let ptr = GlobalLock(hmem) as *mut u8;
-        if ptr.is_null() { return; }
-
-        let bih = BIH {
-            size: bih_sz as u32, width: w, height: h,
-            planes: 1, bit_count: 24,
-            compression: BI_RGB.0, size_image: (row_stride * h) as u32,
-            x_pels: 0, y_pels: 0, clr_used: 0, clr_important: 0,
-        };
-        std::ptr::copy_nonoverlapping(&bih as *const _ as *const u8, ptr, bih_sz);
-        std::ptr::copy_nonoverlapping(pixel_data.as_ptr(), ptr.add(bih_sz), pixel_data.len());
-        
-        let _ = GlobalUnlock(hmem);
-
-        if OpenClipboard(None).is_ok() {
-            let _ = EmptyClipboard();
-            let handle = windows::Win32::Foundation::HANDLE(hmem.0 as *mut _);
-            let _ = SetClipboardData(8, Some(handle));
-            let _ = CloseClipboard();
+            pixels[idx] = egui::Color32::from_rgba_unmultiplied(
+                sharpen(center.r(), top.r(), bottom.r(), left.r(), right.r()),
+                sharpen(center.g(), top.g(), bottom.g(), left.g(), right.g()),
+                sharpen(center.b(), top.b(), bottom.b(), left.b(), right.b()),
+                center.a(),
+            );
         }
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn clipboard_set_web(img: &ColorImage) {
-    let w = img.size[0] as u32;
-    let h = img.size[1] as u32;
-    let mut rgba_data = Vec::with_capacity((w * h * 4) as usize);
-    for px in &img.pixels {
-        rgba_data.push(px.r());
-        rgba_data.push(px.g());
-        rgba_data.push(px.b());
-        rgba_data.push(px.a());
-    }
-
-    let js_array = js_sys::Uint8Array::from(rgba_data.as_slice());
-
-    let func = js_sys::Function::new_with_args(
-        "w, h, arr",
-        r#"
-        try {
-            const canvas = document.createElement('canvas');
-            canvas.width = w;
-            canvas.height = h;
-            const ctx = canvas.getContext('2d');
-            const imgData = ctx.createImageData(w, h);
-            imgData.data.set(arr);
-            ctx.putImageData(imgData, 0, 0);
-
-            const blobPromise = new Promise((resolve, reject) => {
-                canvas.toBlob((blob) => {
-                    if (blob) resolve(blob);
-                    else reject(new Error("Canvas toBlob failed"));
-                }, 'image/png');
-            });
-
-            const item = new ClipboardItem({ 'image/png': blobPromise });
-            navigator.clipboard.write([item]).then(() => {
-                console.log("Image copied to clipboard successfully via Wasm!");
-            }).catch((err) => {
-                console.error("Clipboard write failed (check browser permissions or user activation timeout):", err);
-            });
-        } catch(e) {
-            console.error("Web clipboard copy exception:", e);
-        }
-        "#
-    );
-    let _ = func.call3(&wasm_bindgen::JsValue::NULL, &wasm_bindgen::JsValue::from(w), &wasm_bindgen::JsValue::from(h), &js_array);
 }
 
 // ---------------------------------------------------------------------------
@@ -644,15 +806,21 @@ impl eframe::App for App {
             if let Some(i) = target {
                 // Set a placeholder to avoid re-triggering
                 self.pages[i].img = Some(egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT));
-                
+
                 let tx = self.tx.clone();
                 let ctx = ctx.clone();
                 let bytes = Arc::clone(self.pdf_bytes.as_ref().unwrap());
+                let render_gen = self.render_gen.load(Ordering::Relaxed);
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
                     let res = render_pdf_page_js(bytes_js, i as u32, 36.0).await;
                     if let Ok(img) = parse_js_image(res) {
-                        let _ = tx.send((i, img, false));
+                        let _ = tx.send(AppMsg::Rendered {
+                            render_gen,
+                            page: i,
+                            img,
+                            is_full_res: false,
+                        });
                         ctx.request_repaint();
                     }
                 });
@@ -660,26 +828,69 @@ impl eframe::App for App {
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
-            // Take only the first file for now to be stable
+            for f in &dropped {
+                eprintln!(
+                    "File dropped: name={}, path={:?}, bytes={}",
+                    f.name,
+                    f.path,
+                    f.bytes.as_ref().map(|b| b.len()).unwrap_or(0)
+                );
+            }
             let f = &dropped[0];
-            if let Some(bytes) = &f.bytes {
-                self.load_pdf_bytes(bytes.to_vec().into(), Some(&f.name));
-            } else if let Some(path) = &f.path {
-                if path.extension().map_or(false, |e| e == "pdf") {
-                    self.load_pdf_path(&path.to_string_lossy());
+            if let Some(path) = &f.path {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                eprintln!("Extension detected: '{}'", ext);
+                if ext == "pdf" {
+                    self.load_pdf_path(path);
+                } else {
+                    eprintln!("Ignoring file with extension: '{}'", ext);
+                    self.status = format!("Ignored non-PDF file: {}", f.name);
                 }
+            } else if let Some(bytes) = &f.bytes {
+                eprintln!("Loading from dropped bytes ({} bytes)", bytes.len());
+                self.load_pdf_bytes(bytes.to_vec().into(), Some(&f.name));
             } else {
-                self.status = format!("Waiting for data: {}...", f.name);
+                eprintln!("Dropped file has no path or bytes");
+                self.status = format!("Dropped file has no path/data: {}", f.name);
             }
         }
 
-
         // Receive copy finished notifications
         if let Ok(rx) = self.copy_rx.try_lock() {
-            while let Ok(i) = rx.try_recv() {
-                if i < self.pages.len() {
-                    self.pages[i].copy_state = CopyState::Done;
-                    self.status = (self.tr.status_copy_done)(i + 1);
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    CopyMsg::Done {
+                        doc_gen,
+                        copy_gen,
+                        page: i,
+                    } => {
+                        if doc_gen == self.doc_gen.load(Ordering::Relaxed)
+                            && copy_gen == self.copy_gen.load(Ordering::Relaxed)
+                            && i < self.pages.len()
+                        {
+                            self.pages[i].copy_state = CopyState::Done;
+                            self.copied_page = Some(i);
+                            self.status = (self.tr.status_copy_done)(i + 1);
+                        }
+                    }
+                    CopyMsg::Failed {
+                        doc_gen,
+                        copy_gen,
+                        page: i,
+                        error,
+                    } => {
+                        if doc_gen == self.doc_gen.load(Ordering::Relaxed)
+                            && copy_gen == self.copy_gen.load(Ordering::Relaxed)
+                            && i < self.pages.len()
+                        {
+                            self.pages[i].copy_state = CopyState::Idle;
+                            self.status = format!("Error: {error}");
+                        }
+                    }
                 }
             }
         }
@@ -687,64 +898,164 @@ impl eframe::App for App {
         {
             let rx = self.rx.lock().unwrap();
             let mut n_recv = 0;
-            while let Ok((i, img, is_full)) = rx.try_recv() {
-                if i == usize::MAX {
-                    // WASM: PDF Info received
-                    let n = img.size[0] as u32;
-                    let aspect = img.size[1] as f32 / 1000.0;
-                    self.page_count = n;
-                    self.page_aspect = aspect;
-                    self.pages = (0..n).map(|_| PageSlot { 
-                        tex: None, 
-                        img: None, 
-                        is_full_res: false, 
-                        copy_state: CopyState::Idle,
-                    }).collect();
-                    self.status = format!("PDF loaded: {} pages", n);
-                    continue;
-                }
-
-                if i < self.pages.len() {
-                    // Only update texture if it's the low-res pass (is_full == false)
-                    // or if we somehow don't have a texture yet.
-                    if !is_full || self.pages[i].tex.is_none() {
-                        self.pages[i].tex = Some(
-                            ctx.load_texture(format!("p{i}"), img.clone(), TextureOptions::LINEAR)
-                        );
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    AppMsg::Rendered {
+                        render_gen,
+                        page: i,
+                        img,
+                        is_full_res: is_full,
+                    } => {
+                        if render_gen == self.render_gen.load(Ordering::Relaxed)
+                            && i < self.pages.len()
+                        {
+                            // Only update texture if it's the low-res pass (is_full == false)
+                            // or if we somehow don't have a texture yet.
+                            if !is_full || self.pages[i].tex.is_none() {
+                                self.pages[i].tex = Some(ctx.load_texture(
+                                    format!("p{i}"),
+                                    img.clone(),
+                                    TextureOptions::LINEAR,
+                                ));
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                self.pages[i].img = Some(img.clone());
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                if is_full {
+                                    self.pages[i].img = Some(img.clone());
+                                }
+                            }
+                            self.pages[i].is_full_res = is_full;
+                            self.pages[i].render_error = None;
+                        }
                     }
-                    self.pages[i].img = Some(img.clone());
-                    self.pages[i].is_full_res = is_full;
-                    
-                    if is_full {
-                        self.pages[i].copy_state = CopyState::Done;
-                        self.copied_page = Some(i);
-                        self.status = (self.tr.status_copy_done)(i + 1);
-                        #[cfg(target_arch = "wasm32")]
-                        clipboard_set_web(&img);
+                    AppMsg::RenderFailed {
+                        render_gen,
+                        page: i,
+                        error,
+                    } => {
+                        if render_gen == self.render_gen.load(Ordering::Relaxed)
+                            && i < self.pages.len()
+                        {
+                            self.pages[i].tex = None;
+                            self.pages[i].render_error = Some(error.clone());
+                            self.status = format!("Page {} render failed: {error}", i + 1);
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    AppMsg::Loaded {
+                        doc_gen,
+                        result: res,
+                    } => {
+                        if doc_gen != self.doc_gen.load(Ordering::Relaxed) {
+                            n_recv += 1;
+                            if n_recv >= 4 {
+                                break;
+                            }
+                            continue;
+                        }
+                        match res {
+                            Ok(loaded) => {
+                                eprintln!("PDF loaded successfully: {} pages", loaded.page_count);
+                                self.page_aspect = loaded.aspect;
+                                self.page_count = loaded.page_count;
+                                self.copied_page = None;
+                                self.selected_page = Some(0);
+                                self.pages = (0..loaded.page_count)
+                                    .map(|_| PageSlot {
+                                        tex: None,
+                                        img: None,
+                                        is_full_res: false,
+                                        copy_state: CopyState::Idle,
+                                        render_error: None,
+                                    })
+                                    .collect();
+                                self.pdf_bytes = Some(loaded.bytes);
+                                self.status = format!(
+                                    "{}{}",
+                                    loaded.name,
+                                    (self.tr.pages_count)(loaded.page_count)
+                                );
+                                self.spawn_render(loaded.page_count, self.thumb_size);
+                            }
+                            Err(e) => {
+                                eprintln!("PDF load error: {}", e);
+                                self.status = e;
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    AppMsg::PdfInfo {
+                        doc_gen,
+                        page_count,
+                        aspect,
+                    } => {
+                        if doc_gen != self.doc_gen.load(Ordering::Relaxed) {
+                            n_recv += 1;
+                            if n_recv >= 4 {
+                                break;
+                            }
+                            continue;
+                        }
+                        self.page_count = page_count;
+                        self.page_aspect = aspect;
+                        self.selected_page = Some(0);
+                        self.pages = (0..page_count)
+                            .map(|_| PageSlot {
+                                tex: None,
+                                img: None,
+                                is_full_res: false,
+                                copy_state: CopyState::Idle,
+                                render_error: None,
+                            })
+                            .collect();
+                        self.status = format!("PDF loaded: {} pages", page_count);
                     }
                 }
                 n_recv += 1;
-                if n_recv >= 4 { break; }
+                if n_recv >= 4 {
+                    break;
+                }
             }
         }
         // Repaint if we still have pages that haven't even finished pass 1
-        if self.page_count > 0 && self.pages.iter().any(|p| p.tex.is_none()) {
+        if self.page_count > 0
+            && self
+                .pages
+                .iter()
+                .any(|p| p.tex.is_none() && p.render_error.is_none())
+        {
             ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.style_mut().spacing.item_spacing.y = 0.0;
                 ui.label(self.tr.dpi);
-                ui.add(egui::DragValue::new(&mut self.dpi)
-                    .range(72.0..=600.0f32).speed(1.0).suffix(" dpi"));
+                ui.add(
+                    egui::DragValue::new(&mut self.dpi)
+                        .range(72.0..=600.0f32)
+                        .speed(1.0)
+                        .suffix(" dpi"),
+                );
                 ui.add_space(16.0);
                 ui.label(self.tr.thumbnail);
                 let old = self.thumb_size;
-                ui.add(egui::DragValue::new(&mut self.thumb_size)
-                    .range(80..=512u32).speed(8.0).suffix(" px"));
+                ui.add(
+                    egui::DragValue::new(&mut self.thumb_size)
+                        .range(80..=512u32)
+                        .speed(8.0)
+                        .suffix(" px"),
+                );
                 self.thumb_size = (self.thumb_size / 8) * 8;
                 if self.thumb_size != old && self.pdf_bytes.is_some() {
-                    for p in &mut self.pages { p.tex = None; }
+                    for p in &mut self.pages {
+                        p.tex = None;
+                        p.render_error = None;
+                    }
                     self.spawn_render(self.page_count, self.thumb_size);
                 }
                 ui.add_space(16.0);
@@ -759,7 +1070,8 @@ impl eframe::App for App {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new(self.tr.drop_pdf)
-                            .color(egui::Color32::GRAY).size(20.0)
+                            .color(egui::Color32::GRAY)
+                            .size(20.0),
                     );
                 });
                 return;
@@ -770,36 +1082,40 @@ impl eframe::App for App {
 
             let thumb_f = self.thumb_size as f32;
             let avail_w = ui.available_width();
-            let cell_w  = (thumb_f * self.page_aspect).max(20.0);
-            let cols    = (avail_w / cell_w).floor().max(1.0) as usize;
-            let gap     = if cols > 1 {
+            let cell_w = (thumb_f * self.page_aspect).max(20.0);
+            let cols = (avail_w / cell_w).floor().max(1.0) as usize;
+            let gap = if cols > 1 {
                 ((avail_w - cols as f32 * cell_w) / (cols - 1) as f32).max(0.0)
             } else {
                 0.0
             };
-            let cell_h  = thumb_f + 20.0;
+            let cell_h = thumb_f + 20.0;
 
             // Keyboard navigation
             let mut scroll_to_selected = false;
             if self.page_count > 0 {
                 let n = self.page_count as usize;
                 let cur = self.selected_page.unwrap_or(0);
-                
+
                 ui.input(|i| {
                     if i.key_pressed(egui::Key::ArrowRight) {
-                        self.selected_page = Some((cur + 1).min(n - 1));
+                        let new_idx = (cur + 1).min(n - 1);
+                        self.selected_page = Some(new_idx);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowLeft) {
-                        self.selected_page = Some(cur.saturating_sub(1));
+                        let new_idx = cur.saturating_sub(1);
+                        self.selected_page = Some(new_idx);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowDown) {
-                        self.selected_page = Some((cur + cols).min(n - 1));
+                        let new_idx = (cur + cols).min(n - 1);
+                        self.selected_page = Some(new_idx);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowUp) {
-                        self.selected_page = Some(cur.saturating_sub(cols));
+                        let new_idx = cur.saturating_sub(cols);
+                        self.selected_page = Some(new_idx);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::PageUp) {
@@ -830,6 +1146,8 @@ impl eframe::App for App {
 
             let mut red_borders = Vec::new();
             let mut blue_border = None;
+            let mut hover_rect = None;
+            let pointer_moved = ui.input(|i| i.pointer.delta().length_sq() > 0.0);
 
             ScrollArea::vertical().show(ui, |ui| {
                 // Increase scroll sensitivity (add extra scroll)
@@ -842,20 +1160,23 @@ impl eframe::App for App {
                         ui.spacing_mut().item_spacing.x = gap;
                         for col in 0..cols {
                             let i = row * cols + col;
-                            if i >= n { break; }
+                            if i >= n {
+                                break;
+                            }
                             ui.allocate_ui_with_layout(
                                 egui::vec2(cell_w, cell_h),
                                 egui::Layout::top_down(egui::Align::Center),
                                 |ui| {
                                     let (resp, rect) = if let Some(tex) = &self.pages[i].tex {
                                         let [iw, ih] = tex.size();
-                                        let scale = (cell_w / iw as f32)
-                                            .min(thumb_f / ih as f32);
+                                        let scale = (cell_w / iw as f32).min(thumb_f / ih as f32);
                                         let disp = egui::vec2(iw as f32 * scale, ih as f32 * scale);
                                         let resp = ui.add(
-                                            egui::Image::new(
-                                                egui::load::SizedTexture::new(tex.id(), disp))
-                                            .sense(egui::Sense::click())
+                                            egui::Image::new(egui::load::SizedTexture::new(
+                                                tex.id(),
+                                                disp,
+                                            ))
+                                            .sense(egui::Sense::click()),
                                         );
                                         let rect = resp.rect;
                                         (resp, rect)
@@ -864,52 +1185,111 @@ impl eframe::App for App {
                                             egui::vec2(cell_w.min(thumb_f), thumb_f),
                                             egui::Sense::click(),
                                         );
-                                        ui.painter().rect_filled(
-                                            rect, 4.0, egui::Color32::from_gray(50));
+                                        let fill = if self.pages[i].render_error.is_some() {
+                                            egui::Color32::from_rgb(70, 35, 35)
+                                        } else {
+                                            egui::Color32::from_gray(50)
+                                        };
+                                        ui.painter().rect_filled(rect, 4.0, fill);
+                                        if self.pages[i].render_error.is_some() {
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "Render\nerror",
+                                                egui::FontId::proportional(13.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
                                         (resp, rect)
                                     };
 
-                                    if resp.clicked() { 
+                                    if resp.clicked() {
                                         clicked = Some(i);
+                                        self.selected_page = Some(i);
+                                    }
+                                    if resp.hovered() && pointer_moved {
                                         self.selected_page = Some(i);
                                     }
 
                                     // Selection/Focus highlight (Unified Mouse & Keyboard)
-                                    if self.selected_page == Some(i) && self.pages[i].copy_state != CopyState::Done {
-                                        // Translucent Blue highlight
-                                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(0, 120, 215, 100));
-                                        
+                                    let is_selected = self.selected_page == Some(i);
+
+                                    if is_selected && self.pages[i].copy_state != CopyState::Done {
+                                        // Unified Blue highlight
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            0.0,
+                                            egui::Color32::from_rgba_unmultiplied(0, 120, 215, 100),
+                                        );
+
+                                        // Show guide text
                                         let txt = self.tr.click_to_copy;
                                         let font = egui::FontId::proportional(14.0);
                                         let center = rect.center();
-                                        
-                                        // Create two galleys for correct coloring and alignment
-                                        // Use f32::INFINITY for wrap_width to get the exact text size
-                                        let mut job_w = egui::text::LayoutJob::simple(txt.to_string(), font.clone(), egui::Color32::WHITE, f32::INFINITY);
+
+                                        let mut job_w = egui::text::LayoutJob::simple(
+                                            txt.to_string(),
+                                            font.clone(),
+                                            egui::Color32::WHITE,
+                                            f32::INFINITY,
+                                        );
                                         job_w.halign = egui::Align::Center;
-                                        let mut job_b = egui::text::LayoutJob::simple(txt.to_string(), font.clone(), egui::Color32::BLACK, f32::INFINITY);
+                                        let mut job_b = egui::text::LayoutJob::simple(
+                                            txt.to_string(),
+                                            font.clone(),
+                                            egui::Color32::BLACK,
+                                            f32::INFINITY,
+                                        );
                                         job_b.halign = egui::Align::Center;
-                                        
+
                                         let galley_w = ui.fonts(|f| f.layout_job(job_w));
                                         let galley_b = ui.fonts(|f| f.layout_job(job_b));
-                                        // Use galley.rect.center() for perfect centering regardless of internal offsets
                                         let text_pos = center - galley_w.rect.center().to_vec2();
 
-                                        // Draw white outline
-                                        for off in [egui::vec2(-1.0,-1.0), egui::vec2(1.0,-1.0), egui::vec2(-1.0,1.0), egui::vec2(1.0,1.0)] {
-                                            ui.painter().galley(text_pos + off, galley_w.clone(), egui::Color32::WHITE);
+                                        // Draw white outline for readability
+                                        for off in [
+                                            egui::vec2(-1.0, -1.0),
+                                            egui::vec2(1.0, -1.0),
+                                            egui::vec2(-1.0, 1.0),
+                                            egui::vec2(1.0, 1.0),
+                                        ] {
+                                            ui.painter().galley(
+                                                text_pos + off,
+                                                galley_w.clone(),
+                                                egui::Color32::WHITE,
+                                            );
                                         }
                                         // Draw black main text
-                                        ui.painter().galley(text_pos, galley_b, egui::Color32::BLACK);
+                                        ui.painter().galley(
+                                            text_pos,
+                                            galley_b,
+                                            egui::Color32::BLACK,
+                                        );
+                                    }
+
+                                    if is_selected {
+                                        hover_rect = Some(rect);
                                     }
 
                                     // Status overlay text
                                     match self.pages[i].copy_state {
                                         CopyState::Copying => {
-                                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, self.tr.copying, egui::FontId::proportional(20.0), egui::Color32::WHITE);
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                self.tr.copying,
+                                                egui::FontId::proportional(20.0),
+                                                egui::Color32::WHITE,
+                                            );
                                         }
                                         CopyState::Done => {
-                                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, self.tr.done, egui::FontId::proportional(20.0), egui::Color32::WHITE);
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                self.tr.done,
+                                                egui::FontId::proportional(20.0),
+                                                egui::Color32::WHITE,
+                                            );
                                             red_borders.push(rect);
                                         }
                                         CopyState::Idle => {}
@@ -918,13 +1298,25 @@ impl eframe::App for App {
                                     // Page number overlay (bottom-center)
                                     let txt = format!("{}", i + 1);
                                     let font = egui::FontId::proportional(11.0);
-                                    let galley = ui.painter().layout_no_wrap(txt, font, egui::Color32::BLACK);
+                                    let galley = ui.painter().layout_no_wrap(
+                                        txt,
+                                        font,
+                                        egui::Color32::BLACK,
+                                    );
                                     let bg_rect = egui::Rect::from_center_size(
                                         rect.center_bottom() + egui::vec2(0.0, -8.0),
-                                        galley.size() + egui::vec2(6.0, 2.0)
+                                        galley.size() + egui::vec2(6.0, 2.0),
                                     );
-                                    ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::WHITE.gamma_multiply(0.8));
-                                    ui.painter().galley(bg_rect.min + egui::vec2(3.0, 1.0), galley, egui::Color32::BLACK);
+                                    ui.painter().rect_filled(
+                                        bg_rect,
+                                        2.0,
+                                        egui::Color32::WHITE.gamma_multiply(0.8),
+                                    );
+                                    ui.painter().galley(
+                                        bg_rect.min + egui::vec2(3.0, 1.0),
+                                        galley,
+                                        egui::Color32::BLACK,
+                                    );
 
                                     // Collect Blue border
                                     if self.selected_page == Some(i) {
@@ -941,10 +1333,30 @@ impl eframe::App for App {
 
                 // DRAW BORDERS AT THE END (ON TOP OF EVERYTHING)
                 for r in red_borders {
-                    ui.painter().rect_stroke(r.shrink(2.0), 2.0, egui::Stroke::new(4.0, egui::Color32::RED));
+                    ui.painter().rect_stroke(
+                        r.shrink(2.0),
+                        2.0,
+                        egui::Stroke::new(4.0, egui::Color32::RED),
+                    );
                 }
                 if let Some(r) = blue_border {
-                    ui.painter().rect_stroke(r.expand(2.0), 2.0, egui::Stroke::new(3.0, egui::Color32::from_rgb(0, 120, 215)));
+                    ui.painter().rect_stroke(
+                        r.expand(2.0),
+                        2.0,
+                        egui::Stroke::new(3.0, egui::Color32::from_rgb(0, 120, 215)),
+                    );
+                }
+
+                // Draw hover/selection border.
+                if let Some(r) = hover_rect {
+                    ui.painter().rect_stroke(
+                        r.expand(2.0),
+                        1.0,
+                        egui::Stroke::new(
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 120, 215, 180),
+                        ),
+                    );
                 }
             });
 
@@ -955,7 +1367,6 @@ impl eframe::App for App {
         });
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // main
@@ -974,14 +1385,15 @@ fn main() {
         "PDF Page to Clipboard",
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
     // Redirect log to console
     console_log::init_with_level(log::Level::Info).expect("error initializing logger");
-    
+
     let web_options = eframe::WebOptions::default();
 
     wasm_bindgen_futures::spawn_local(async {
