@@ -96,11 +96,16 @@
                 
                 return {
                     numPages: numPages,
-                    avgAspect: count > 0 ? totalAspect / count : 0.707
+                    avgAspect: count > 0 ? totalAspect / count : 0.707,
+                    error: null
                 };
             } catch (e) {
                 console.error("PDF.js Info Error:", e);
-                throw e;
+                return {
+                    numPages: 0,
+                    avgAspect: 0.707,
+                    error: e ? (e.message || e.toString()) : "PDFの解析に失敗しました（データ破損またはアクセス制限の可能性）。"
+                };
             }
         }
 

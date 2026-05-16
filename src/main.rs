@@ -175,6 +175,11 @@ enum AppMsg {
         aspect: f32,
         name: String,
     },
+    #[cfg(target_arch = "wasm32")]
+    PdfError {
+        doc_gen: u32,
+        error: String,
+    },
 }
 
 enum CopyMsg {
@@ -565,6 +570,14 @@ impl App {
 
             wasm_bindgen_futures::spawn_local(async move {
                 let res = get_pdf_info_js(bytes_js, doc_gen).await;
+                if let Ok(err_val) = js_sys::Reflect::get(&res, &"error".into()) {
+                    if !err_val.is_null() && !err_val.is_undefined() {
+                        let err_str = err_val.as_string().unwrap_or_else(|| "PDFの解析・構造チェックに失敗しました".into());
+                        let _ = tx.send(AppMsg::PdfError { doc_gen, error: err_str });
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
                 let n = js_sys::Reflect::get(&res, &"numPages".into())
                     .unwrap()
                     .as_f64()
@@ -1173,6 +1186,12 @@ impl eframe::App for App {
                             })
                             .collect();
                         self.status = format!("{}{}", name, (self.tr.pages_count)(page_count));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    AppMsg::PdfError { doc_gen, error } => {
+                        if doc_gen == self.doc_gen.load(Ordering::Relaxed) {
+                            self.status = format!("エラー: {}", error);
+                        }
                     }
                 }
                 n_recv += 1;
