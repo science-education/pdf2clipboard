@@ -30,11 +30,10 @@
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
         let cachedPdfDoc = null;
-        let cachedPdfData = null;
+        let cachedDocGen = -1;
 
-        async function get_doc(pdf_data) {
-            // If it's the same data, return cached doc
-            if (cachedPdfDoc && cachedPdfData === pdf_data) {
+        async function get_doc(pdf_data, doc_gen) {
+            if (cachedPdfDoc && cachedDocGen === doc_gen) {
                 return cachedPdfDoc;
             }
             if (cachedPdfDoc) {
@@ -42,20 +41,18 @@
                     await cachedPdfDoc.destroy();
                 } catch (e) { console.warn("PDF.js destroy warning:", e); }
                 cachedPdfDoc = null;
-                cachedPdfData = null;
             }
             const loadingTask = pdfjsLib.getDocument({data: pdf_data});
             cachedPdfDoc = await loadingTask.promise;
-            cachedPdfData = pdf_data;
+            cachedDocGen = doc_gen;
             return cachedPdfDoc;
         }
 
-        async function render_pdf_page_js(pdf_data, page_num, dpi) {
+        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
             try {
-                const pdf = await get_doc(pdf_data);
+                const pdf = await get_doc(pdf_data, doc_gen);
                 const page = await pdf.getPage(page_num + 1);
                 
-                // Calculate scale based on DPI (Standard PDF is 72 DPI)
                 const scale = dpi / 72.0;
                 const viewport = page.getViewport({ scale });
                 
@@ -82,12 +79,11 @@
             }
         }
 
-        async function get_pdf_info_js(pdf_data) {
+        async function get_pdf_info_js(pdf_data, doc_gen) {
             try {
-                const pdf = await get_doc(pdf_data);
+                const pdf = await get_doc(pdf_data, doc_gen);
                 const numPages = pdf.numPages;
                 
-                // Sample first 10 pages for aspect ratio to be fast, or all if small
                 let totalAspect = 0;
                 let count = 0;
                 const sampleLimit = Math.min(numPages, 10); 

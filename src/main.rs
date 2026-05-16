@@ -18,10 +18,10 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = render_pdf_page_js)]
-    async fn render_pdf_page_js(pdf_data: js_sys::Uint8Array, page_num: u32, dpi: f32) -> JsValue;
+    async fn render_pdf_page_js(pdf_data: js_sys::Uint8Array, page_num: u32, dpi: f32, doc_gen: u32) -> JsValue;
 
     #[wasm_bindgen(js_name = get_pdf_info_js)]
-    async fn get_pdf_info_js(pdf_data: js_sys::Uint8Array) -> JsValue;
+    async fn get_pdf_info_js(pdf_data: js_sys::Uint8Array, doc_gen: u32) -> JsValue;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -564,7 +564,7 @@ impl App {
             let name_clone = name.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
-                let res = get_pdf_info_js(bytes_js).await;
+                let res = get_pdf_info_js(bytes_js, doc_gen).await;
                 let n = js_sys::Reflect::get(&res, &"numPages".into())
                     .unwrap()
                     .as_f64()
@@ -688,6 +688,7 @@ impl App {
         if page_num >= self.pages.len() {
             return;
         }
+        #[allow(unused_variables)]
         let doc_gen = self.doc_gen.load(Ordering::Relaxed);
         let copy_gen = self.copy_gen.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -710,11 +711,12 @@ impl App {
             let tr = self.tr;
             let page_num = page_num;
             let dpi = self.dpi;
+            let doc_gen = self.doc_gen.load(Ordering::Relaxed);
 
             self.status = tr.copying.replace("\n", " ");
             wasm_bindgen_futures::spawn_local(async move {
                 let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                let res = render_pdf_page_js(bytes_js, page_num as u32, dpi).await;
+                let res = render_pdf_page_js(bytes_js, page_num as u32, dpi, doc_gen).await;
                 let msg = match parse_js_image(res) {
                     Ok(img) => match platform::clipboard_set_web(&img).await {
                         Ok(()) => CopyMsg::Done {
@@ -948,9 +950,10 @@ impl eframe::App for App {
                 let ctx = ctx.clone();
                 let bytes = Arc::clone(self.pdf_bytes.as_ref().unwrap());
                 let render_gen = self.render_gen.load(Ordering::Relaxed);
+                let doc_gen = self.doc_gen.load(Ordering::Relaxed);
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                    let res = render_pdf_page_js(bytes_js, i as u32, 100.0).await;
+                    let res = render_pdf_page_js(bytes_js, i as u32, 100.0, doc_gen).await;
                     if let Ok(img) = parse_js_image(res) {
                         let _ = tx.send(AppMsg::Rendered {
                             render_gen,

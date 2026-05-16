@@ -19,7 +19,7 @@
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="/pdf2clipboard-20bdc185366fbfdb.js" crossorigin="anonymous" integrity="sha384-ukeL6ItGzAshmAzpa3JFiZphNO7NwHGlDdGwfTVvUjcB/iXUD3oYrQfzn3DFrR3T"><link rel="preload" href="/pdf2clipboard-20bdc185366fbfdb_bg.wasm" crossorigin="anonymous" integrity="sha384-7IoRyhjkFXhSaP42wIVGaJIXXGVWmiNLAXJNLCfCC0OBFp3cj70MEafX5Z5CReae" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pdf2clipboard-19e20525aed2fc47.js" crossorigin="anonymous" integrity="sha384-5fThP4trhAO9h9TI0WsaZzcdhedlHMEGQgZTL1pPpte4eCiBpi/qCmoMdyIjCqs/"><link rel="preload" href="/pdf2clipboard-19e20525aed2fc47_bg.wasm" crossorigin="anonymous" integrity="sha384-leXq3qvDXLBdO9PZwvVZ4Mmne8DuifcUhPzNuAWX6sXophegASsNdDu+VrLpgESP" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
     
@@ -30,25 +30,29 @@
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
         let cachedPdfDoc = null;
-        let cachedPdfData = null;
+        let cachedDocGen = -1;
 
-        async function get_doc(pdf_data) {
-            // If it's the same data, return cached doc
-            if (cachedPdfDoc && cachedPdfData === pdf_data) {
+        async function get_doc(pdf_data, doc_gen) {
+            if (cachedPdfDoc && cachedDocGen === doc_gen) {
                 return cachedPdfDoc;
+            }
+            if (cachedPdfDoc) {
+                try {
+                    await cachedPdfDoc.destroy();
+                } catch (e) { console.warn("PDF.js destroy warning:", e); }
+                cachedPdfDoc = null;
             }
             const loadingTask = pdfjsLib.getDocument({data: pdf_data});
             cachedPdfDoc = await loadingTask.promise;
-            cachedPdfData = pdf_data;
+            cachedDocGen = doc_gen;
             return cachedPdfDoc;
         }
 
-        async function render_pdf_page_js(pdf_data, page_num, dpi) {
+        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
             try {
-                const pdf = await get_doc(pdf_data);
+                const pdf = await get_doc(pdf_data, doc_gen);
                 const page = await pdf.getPage(page_num + 1);
                 
-                // Calculate scale based on DPI (Standard PDF is 72 DPI)
                 const scale = dpi / 72.0;
                 const viewport = page.getViewport({ scale });
                 
@@ -75,12 +79,11 @@
             }
         }
 
-        async function get_pdf_info_js(pdf_data) {
+        async function get_pdf_info_js(pdf_data, doc_gen) {
             try {
-                const pdf = await get_doc(pdf_data);
+                const pdf = await get_doc(pdf_data, doc_gen);
                 const numPages = pdf.numPages;
                 
-                // Sample first 10 pages for aspect ratio to be fast, or all if small
                 let totalAspect = 0;
                 let count = 0;
                 const sampleLimit = Math.min(numPages, 10); 
@@ -107,8 +110,8 @@
     <!-- Trunk will inject the wasm glue script here -->
 
 <script type="module">
-import init, * as bindings from '/pdf2clipboard-20bdc185366fbfdb.js';
-const wasm = await init({ module_or_path: '/pdf2clipboard-20bdc185366fbfdb_bg.wasm' });
+import init, * as bindings from '/pdf2clipboard-19e20525aed2fc47.js';
+const wasm = await init({ module_or_path: '/pdf2clipboard-19e20525aed2fc47_bg.wasm' });
 
 
 window.wasmBindings = bindings;
