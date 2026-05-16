@@ -14,6 +14,8 @@ pdf_oxide = { path = "./pdf_oxide_local", features = ["rendering", "parallel"] }
 log = "0.4"
 rayon = "1.10"
 sys-locale = "0.3"
+ehttp = "0.5"
+urlencoding = "2.1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.61"

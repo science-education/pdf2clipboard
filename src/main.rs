@@ -64,6 +64,10 @@ struct Tr {
     copying: &'static str,
     done: &'static str,
     click_to_copy: &'static str,
+    url_prompt: &'static str,
+    open_url: &'static str,
+    downloading: &'static str,
+    download_err: fn(&str) -> String,
     pages_count: fn(u32) -> String,
     status_copy_done: fn(usize) -> String,
 }
@@ -96,6 +100,10 @@ const TR_EN: Tr = Tr {
     copying: "Copying...",
     done: "Done",
     click_to_copy: "Click\n(Enter)\nto\ncopy",
+    url_prompt: "URL:",
+    open_url: "Load",
+    downloading: "Downloading...",
+    download_err: |e| format!("Download Error: {e}"),
     pages_count: |n| format!(" - {} pages", n),
     status_copy_done: |p| format!("Page {} copied to clipboard", p),
 };
@@ -108,6 +116,10 @@ const TR_JP: Tr = Tr {
     copying: "COPY中",
     done: "完了",
     click_to_copy: "クリック\n(Enter)\nすると\nコピー",
+    url_prompt: "URL:",
+    open_url: "開く",
+    downloading: "ダウンロード中...",
+    download_err: |e| format!("ダウンロード失敗: {e}"),
     pages_count: |n| format!(" - {} ページ", n),
     status_copy_done: |p| format!("ページ {} をクリップボードにコピー完了", p),
 };
@@ -153,6 +165,10 @@ struct App {
     render_gen:      Arc<AtomicU32>,
     #[allow(dead_code)]
     egui_ctx:        egui::Context,
+    url_input:       String,
+    is_downloading:  bool,
+    download_tx:     mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
+    download_rx:     Arc<Mutex<mpsc::Receiver<Result<(Arc<[u8]>, String), String>>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -199,6 +215,7 @@ impl App {
         let tr = Tr::from_locale(sys_locale::get_locale());
         let (tx, rx) = mpsc::channel();
         let (copy_tx, copy_rx) = mpsc::channel();
+        let (download_tx, download_rx) = mpsc::channel();
         Self {
             pdf_bytes: None,
             cached_doc: None,
@@ -217,6 +234,10 @@ impl App {
             copy_rx: Arc::new(Mutex::new(copy_rx)),
             render_gen: Arc::new(AtomicU32::new(0)),
             egui_ctx: cc.egui_ctx.clone(),
+            url_input: String::new(),
+            is_downloading: false,
+            download_tx,
+            download_rx: Arc::new(Mutex::new(download_rx)),
         }
     }
 
@@ -244,6 +265,93 @@ impl App {
             }
             Err(e) => self.status = format!("Error: {e}"),
         }
+    }
+
+    fn fetch_url(&mut self, url: &str) {
+        let url_trimmed = url.trim().to_string();
+        if url_trimmed.is_empty() { return; }
+        self.is_downloading = true;
+        self.status = self.tr.downloading.into();
+
+        let tx = self.download_tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let file_name = url_trimmed.rsplit(['/', '\\', '?']).find(|s| !s.is_empty()).unwrap_or("URL_PDF").to_string();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let req = ehttp::Request::get(&url_trimmed);
+            ehttp::fetch(req, move |res| {
+                match res {
+                    Ok(response) if response.ok => {
+                        let _ = tx.send(Ok((response.bytes.into(), file_name)));
+                    }
+                    Ok(response) => {
+                        let _ = tx.send(Err(format!("HTTP {} {}", response.status, response.status_text)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+                ctx.request_repaint();
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if url_trimmed.starts_with("http://localhost") || url_trimmed.starts_with("http://127.0.0.1") {
+                let req = ehttp::Request::get(&url_trimmed);
+                ehttp::fetch(req, move |res| {
+                    match res {
+                        Ok(response) if response.ok => { let _ = tx.send(Ok((response.bytes.into(), file_name))); }
+                        Ok(response) => { let _ = tx.send(Err(format!("HTTP {} {}", response.status, response.status_text))); }
+                        Err(e) => { let _ = tx.send(Err(e)); }
+                    }
+                    ctx.request_repaint();
+                });
+            } else {
+                let encoded = urlencoding::encode(&url_trimmed);
+                let proxies = vec![
+                    format!("https://api.codetabs.com/v1/proxy/?quest={}", url_trimmed),
+                    format!("https://corsproxy.io/?{}", encoded),
+                    format!("https://api.allorigins.win/raw?url={}", encoded),
+                ];
+                Self::try_fetch_proxies(proxies, 0, tx, ctx, file_name);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn try_fetch_proxies(
+        proxies: Vec<String>,
+        idx: usize,
+        tx: mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
+        ctx: egui::Context,
+        file_name: String,
+    ) {
+        if idx >= proxies.len() {
+            let _ = tx.send(Err("すべてのCORSプロキシでのダウンロードに失敗しました。".into()));
+            ctx.request_repaint();
+            return;
+        }
+
+        let req = ehttp::Request::get(&proxies[idx]);
+        let proxies_clone = proxies.clone();
+        let tx_clone = tx.clone();
+        let ctx_clone = ctx.clone();
+        let file_name_clone = file_name.clone();
+
+        ehttp::fetch(req, move |res| {
+            match res {
+                Ok(response) if response.ok => {
+                    let _ = tx_clone.send(Ok((response.bytes.into(), file_name_clone)));
+                    ctx_clone.request_repaint();
+                }
+                _ => {
+                    // Try next proxy
+                    Self::try_fetch_proxies(proxies_clone, idx + 1, tx_clone, ctx_clone, file_name_clone);
+                }
+            }
+        });
     }
 
     fn do_load(&mut self, bytes: Arc<[u8]>) -> Result<u32, String> {
@@ -684,6 +792,25 @@ impl eframe::App for App {
             }
         }
 
+        // Receive downloaded PDF bytes
+        let mut downloaded_data = None;
+        if let Ok(rx) = self.download_rx.try_lock() {
+            if let Ok(res) = rx.try_recv() {
+                downloaded_data = Some(res);
+            }
+        }
+        if let Some(res) = downloaded_data {
+            self.is_downloading = false;
+            match res {
+                Ok((bytes, name)) => {
+                    self.load_pdf_bytes(bytes, Some(&name));
+                }
+                Err(e) => {
+                    self.status = (self.tr.download_err)(&e);
+                }
+            }
+        }
+
         {
             let rx = self.rx.lock().unwrap();
             let mut n_recv = 0;
@@ -747,6 +874,19 @@ impl eframe::App for App {
                     for p in &mut self.pages { p.tex = None; }
                     self.spawn_render(self.page_count, self.thumb_size);
                 }
+                ui.add_space(16.0);
+
+                ui.label(self.tr.url_prompt);
+                let url_resp = ui.add(egui::TextEdit::singleline(&mut self.url_input)
+                    .hint_text("https://...")
+                    .desired_width(180.0));
+                if ui.button(self.tr.open_url).clicked() || (url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    self.fetch_url(&self.url_input.clone());
+                }
+                if self.is_downloading {
+                    ui.spinner();
+                }
+                ui.add_space(16.0);
                 ui.add_space(16.0);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
