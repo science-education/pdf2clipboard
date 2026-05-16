@@ -174,6 +174,8 @@ enum AppMsg {
         page_count: u32,
         aspect: f32,
     },
+    #[cfg(target_arch = "wasm32")]
+    FontLoaded(Vec<u8>),
 }
 
 enum CopyMsg {
@@ -318,28 +320,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
     #[cfg(target_arch = "wasm32")]
     {
-        log::info!("Starting asynchronous Japanese Web Font download for Wasm...");
-        let ctx_clone = ctx.clone();
-        let url = "https://cdn.jsdelivr.net/gh/googlefonts/mplus-fonts@master/fonts/ttf/Mplus1p-Regular.ttf";
-        let req = ehttp::Request::get(url);
-        ehttp::fetch(req, move |res| {
-            if let Ok(response) = res {
-                if response.ok {
-                    let mut fonts = egui::FontDefinitions::default();
-                    fonts.font_data.insert("jp".to_owned(), egui::FontData::from_owned(response.bytes));
-                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                        if let Some(v) = fonts.families.get_mut(&family) {
-                            v.insert(0, "jp".to_owned());
-                        }
-                    }
-                    ctx_clone.set_fonts(fonts);
-                    log::info!("Successfully loaded Japanese font (Mplus1p-Regular.ttf) from Web!");
-                    ctx_clone.request_repaint();
-                } else {
-                    log::error!("Failed to load Japanese font: HTTP {}", response.status);
-                }
-            }
-        });
+        log::info!("Wasm Japanese Font will be loaded via App::new async fetch.");
     }
 
     ctx.set_fonts(fonts);
@@ -352,6 +333,26 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (copy_tx, copy_rx) = mpsc::channel();
         let (download_tx, download_rx) = mpsc::channel();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            log::info!("Starting asynchronous Japanese Web Font download for Wasm...");
+            let tx_clone = tx.clone();
+            let ctx_clone = cc.egui_ctx.clone();
+            let url = "https://cdn.jsdelivr.net/gh/googlefonts/mplus-fonts@master/fonts/ttf/Mplus1p-Regular.ttf";
+            let req = ehttp::Request::get(url);
+            ehttp::fetch(req, move |res| {
+                if let Ok(response) = res {
+                    if response.ok {
+                        let _ = tx_clone.send(AppMsg::FontLoaded(response.bytes));
+                        ctx_clone.request_repaint();
+                    } else {
+                        log::error!("Failed to load Japanese font: HTTP {}", response.status);
+                    }
+                }
+            });
+        }
+
         Self {
             pdf_bytes: None,
             copied_page: None,
@@ -951,9 +952,10 @@ impl eframe::App for App {
                 let ctx = ctx.clone();
                 let bytes = Arc::clone(self.pdf_bytes.as_ref().unwrap());
                 let render_gen = self.render_gen.load(Ordering::Relaxed);
+                let dpi = (self.thumb_size as f32 * 0.5).max(36.0);
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                    let res = render_pdf_page_js(bytes_js, i as u32, 36.0).await;
+                    let res = render_pdf_page_js(bytes_js, i as u32, dpi).await;
                     if let Ok(img) = parse_js_image(res) {
                         let _ = tx.send(AppMsg::Rendered {
                             render_gen,
@@ -1173,6 +1175,18 @@ impl eframe::App for App {
                             .collect();
                         self.status = format!("PDF loaded: {} pages", page_count);
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    AppMsg::FontLoaded(bytes) => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.font_data.insert("jp".to_owned(), egui::FontData::from_owned(bytes));
+                        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                            if let Some(v) = fonts.families.get_mut(&family) {
+                                v.insert(0, "jp".to_owned());
+                            }
+                        }
+                        ctx.set_fonts(fonts);
+                        log::info!("Wasm Japanese Font successfully applied in update!");
+                    }
                 }
                 n_recv += 1;
                 if n_recv >= 4 {
@@ -1213,6 +1227,7 @@ impl eframe::App for App {
                 if self.thumb_size != old && self.pdf_bytes.is_some() {
                     for p in &mut self.pages {
                         p.tex = None;
+                        p.img = None;
                         p.render_error = None;
                     }
                     self.spawn_render(self.page_count, self.thumb_size);
