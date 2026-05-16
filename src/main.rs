@@ -17,11 +17,46 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_name = render_pdf_page_js)]
-    async fn render_pdf_page_js(pdf_data: js_sys::Uint8Array, page_num: u32, dpi: f32, doc_gen: u32) -> JsValue;
+    #[wasm_bindgen(catch, js_name = render_pdf_page_js)]
+    async fn render_pdf_page_js(
+        pdf_data: js_sys::Uint8Array,
+        page_num: u32,
+        dpi: f32,
+        doc_gen: u32,
+    ) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = render_pdf_page_fit_js)]
+    async fn render_pdf_page_fit_js(
+        pdf_data: js_sys::Uint8Array,
+        page_num: u32,
+        max_size: f32,
+        doc_gen: u32,
+    ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(js_name = get_pdf_info_js)]
     async fn get_pdf_info_js(pdf_data: js_sys::Uint8Array, doc_gen: u32) -> JsValue;
+
+    #[wasm_bindgen(js_name = cancel_pdf_js)]
+    fn cancel_pdf_js(doc_gen: u32);
+
+    #[wasm_bindgen(js_name = get_thumbnail_cache_size_js)]
+    fn get_thumbnail_cache_size_js() -> u32;
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error_to_string(err: JsValue) -> String {
+    err.as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&err, &"message".into())
+                .ok()
+                .and_then(|message| message.as_string())
+        })
+        .unwrap_or_else(|| format!("{:?}", err))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn empty_pdf_data_js() -> js_sys::Uint8Array {
+    js_sys::Uint8Array::new_with_length(0)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -65,16 +100,28 @@ struct Tr {
     url_prompt: &'static str,
     open_url: &'static str,
     downloading: &'static str,
+    #[allow(dead_code)]
+    direct_path_unsupported: &'static str,
+    invalid_pdf_data: &'static str,
+    #[allow(dead_code)]
+    proxy_pdf_err: &'static str,
+    #[allow(dead_code)]
+    pdf_parse_failed: &'static str,
+    error: fn(&str) -> String,
+    loading: fn(&str) -> String,
     download_err: fn(&str) -> String,
     #[allow(dead_code)]
     pages_count: fn(u32) -> String,
     status_copy_done: fn(usize) -> String,
+    status_ignored_non_pdf: fn(&str) -> String,
+    status_dropped_no_data: fn(&str) -> String,
+    status_render_failed: fn(usize, &str) -> String,
 }
 
 impl Tr {
     fn from_locale(locale: Option<String>) -> &'static Self {
         if let Some(l) = locale {
-            if l.starts_with("ja") {
+            if l.to_ascii_lowercase().starts_with("ja") {
                 return &TR_JP;
             }
         }
@@ -91,6 +138,16 @@ impl Tr {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn app_locale() -> Option<String> {
+    web_sys::window().and_then(|window| window.navigator().language())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn app_locale() -> Option<String> {
+    sys_locale::get_locale()
+}
+
 const TR_EN: Tr = Tr {
     is_jp: false,
     drop_pdf: "Drop a PDF file onto this window",
@@ -102,9 +159,18 @@ const TR_EN: Tr = Tr {
     url_prompt: "URL:",
     open_url: "Load",
     downloading: "Downloading...",
+    direct_path_unsupported: "Direct file path access is not supported on Web. Use drag-and-drop.",
+    invalid_pdf_data: "The received data is not a valid PDF file. The site may be blocking access.",
+    proxy_pdf_err: "All proxy servers failed to download valid PDF data. The site may be blocking access.",
+    pdf_parse_failed: "PDF parsing or structure validation failed.",
+    error: |e| format!("Error: {e}"),
+    loading: |name| format!("Loading {name}..."),
     download_err: |e| format!("Download Error: {e}"),
     pages_count: |n| format!(" - {} pages", n),
     status_copy_done: |p| format!("Page {} copied to clipboard", p),
+    status_ignored_non_pdf: |name| format!("Ignored non-PDF file: {name}"),
+    status_dropped_no_data: |name| format!("Dropped file has no path/data: {name}"),
+    status_render_failed: |p, e| format!("Page {p} render failed: {e}"),
 };
 
 const TR_JP: Tr = Tr {
@@ -118,9 +184,18 @@ const TR_JP: Tr = Tr {
     url_prompt: "URL:",
     open_url: "開く",
     downloading: "ダウンロード中...",
+    direct_path_unsupported: "Web版ではファイルパスを直接開けません。ドラッグ＆ドロップを使用してください。",
+    invalid_pdf_data: "取得したデータが有効なPDFファイルではありません。サーバーによるアクセス制限等の可能性があります。",
+    proxy_pdf_err: "すべてのプロキシサーバーで有効なPDFデータのダウンロードに失敗しました。サイトのアクセス制限等の可能性があります。",
+    pdf_parse_failed: "PDFの解析・構造チェックに失敗しました。",
+    error: |e| format!("エラー: {e}"),
+    loading: |name| format!("{name} を読み込み中..."),
     download_err: |e| format!("ダウンロード失敗: {e}"),
     pages_count: |n| format!(" - {} ページ", n),
     status_copy_done: |p| format!("ページ {} をクリップボードにコピー完了", p),
+    status_ignored_non_pdf: |name| format!("PDFではないファイルを無視しました: {name}"),
+    status_dropped_no_data: |name| format!("ドロップされたファイルにパスまたはデータがありません: {name}"),
+    status_render_failed: |p, e| format!("ページ {p} のレンダリングに失敗しました: {e}"),
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +215,64 @@ struct PageSlot {
     is_full_res: bool,
     copy_state: CopyState,
     render_error: Option<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+const WASM_THUMBNAIL_RENDER_HARD_CAP: usize = 3;
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_thumbnail_parallelism() -> usize {
+    let hardware_threads = web_sys::window()
+        .map(|window| window.navigator().hardware_concurrency() as usize)
+        .unwrap_or(2);
+    (hardware_threads / 2)
+        .clamp(1, WASM_THUMBNAIL_RENDER_HARD_CAP)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_wasm_render_candidate(pages: &[PageSlot], in_flight: &[usize], i: usize) -> bool {
+    pages[i].img.is_none() && !in_flight.contains(&i)
+}
+
+#[cfg(windows)]
+fn desktop_thumb_cache_size() -> u32 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    let Ok(()) = (unsafe { GlobalMemoryStatusEx(&mut status) }) else {
+        return 200;
+    };
+
+    let gb = 1024_u64 * 1024 * 1024;
+    let total_gb = status.ullTotalPhys / gb;
+    let avail_gb = status.ullAvailPhys / gb;
+
+    let by_total = if total_gb <= 4 {
+        120
+    } else if total_gb <= 8 {
+        200
+    } else {
+        320
+    };
+    let by_avail = if avail_gb < 1 {
+        80
+    } else if avail_gb < 2 {
+        120
+    } else if avail_gb < 4 {
+        200
+    } else {
+        320
+    };
+
+    by_total.min(by_avail).clamp(80, 320)
+}
+
+#[cfg(all(not(windows), not(target_arch = "wasm32")))]
+fn desktop_thumb_cache_size() -> u32 {
+    200
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -203,6 +336,7 @@ struct App {
     page_count: u32,
     pages: Vec<PageSlot>,
     thumb_size: u32,
+    thumb_cache_size: u32,
     page_aspect: f32,
     dpi: f32,
     status: String,
@@ -223,6 +357,8 @@ struct App {
     egui_ctx: egui::Context,
     url_input: String,
     is_downloading: bool,
+    #[cfg(target_arch = "wasm32")]
+    wasm_render_in_flight: Vec<usize>,
     download_tx: mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
     download_rx: Arc<Mutex<mpsc::Receiver<Result<(Arc<[u8]>, String), String>>>>,
 }
@@ -324,7 +460,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
     #[cfg(target_arch = "wasm32")]
     {
-        log::info!("Loading bundled BIZ UD Gothic Japanese font for Wasm...");
+        log::info!("Loading bundled Noto Sans JP 400 Regular Japanese font for Wasm...");
         let font_bytes = include_bytes!("../assets/font.ttf");
         fonts.font_data.insert("jp".to_owned(), egui::FontData::from_static(font_bytes));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -340,7 +476,7 @@ fn setup_fonts(ctx: &egui::Context) {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         setup_fonts(&cc.egui_ctx);
-        let tr = Tr::from_locale(sys_locale::get_locale());
+        let tr = Tr::from_locale(app_locale());
         let (tx, rx) = mpsc::channel();
         let (copy_tx, copy_rx) = mpsc::channel();
         let (download_tx, download_rx) = mpsc::channel();
@@ -352,6 +488,10 @@ impl App {
             page_count: 0,
             pages: Vec::new(),
             thumb_size: 200,
+            #[cfg(not(target_arch = "wasm32"))]
+            thumb_cache_size: desktop_thumb_cache_size(),
+            #[cfg(target_arch = "wasm32")]
+            thumb_cache_size: get_thumbnail_cache_size_js().clamp(80, 320),
             page_aspect: 0.707,
             dpi: 300.0,
             status: tr.drop_pdf.into(),
@@ -366,6 +506,8 @@ impl App {
             egui_ctx: cc.egui_ctx.clone(),
             url_input: String::new(),
             is_downloading: false,
+            #[cfg(target_arch = "wasm32")]
+            wasm_render_in_flight: Vec::new(),
             download_tx,
             download_rx: Arc::new(Mutex::new(download_rx)),
         }
@@ -387,7 +529,7 @@ impl App {
                 .and_then(|n| n.to_str())
                 .unwrap_or("PDF")
                 .to_owned();
-            self.status = format!("Loading {name}...");
+            self.status = (self.tr.loading)(&name);
             let spawn_res = std::thread::Builder::new()
                 .name("pdf-loader".into())
                 .stack_size(16 * 1024 * 1024)
@@ -399,7 +541,7 @@ impl App {
                         }
                         Err(e) => {
                             eprintln!("File read error for {:?}: {}", path, e);
-                            Err(format!("Error: {e}"))
+                            Err(e.to_string())
                         }
                     };
                     let _ = tx.send(AppMsg::Loaded {
@@ -409,14 +551,13 @@ impl App {
                     ctx.request_repaint();
                 });
             if let Err(e) = spawn_res {
-                self.status = format!("Error: {e}");
+                self.status = (self.tr.error)(&e.to_string());
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             let _ = path;
-            self.status =
-                "Direct file path access is not supported on Web. Use drag-and-drop.".into();
+            self.status = self.tr.direct_path_unsupported.into();
         }
     }
 
@@ -426,7 +567,7 @@ impl App {
             .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p))
             .unwrap_or("PDF")
             .to_owned();
-        self.status = format!("Loading {display_name}...");
+        self.status = (self.tr.loading)(&display_name);
         self.do_load(bytes, display_name);
     }
 
@@ -435,6 +576,20 @@ impl App {
         if url_trimmed.is_empty() { return; }
         self.is_downloading = true;
         self.status = self.tr.downloading.into();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let cancel_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            self.render_gen.fetch_add(1, Ordering::Relaxed);
+            self.copy_gen.fetch_add(1, Ordering::Relaxed);
+            self.pages.clear();
+            self.pdf_bytes = None;
+            self.copied_page = None;
+            self.selected_page = None;
+            self.page_count = 0;
+            self.wasm_render_in_flight.clear();
+            cancel_pdf_js(cancel_gen);
+        }
 
         let tx = self.download_tx.clone();
         let ctx = self.egui_ctx.clone();
@@ -478,7 +633,14 @@ impl App {
                     format!("https://corsproxy.io/?{}", encoded),
                     format!("https://api.allorigins.win/raw?url={}", encoded),
                 ];
-                Self::try_fetch_proxies(proxies, 0, tx, ctx, file_name);
+                Self::try_fetch_proxies(
+                    proxies,
+                    0,
+                    tx,
+                    ctx,
+                    file_name,
+                    self.tr.proxy_pdf_err.to_owned(),
+                );
             }
         }
     }
@@ -490,9 +652,10 @@ impl App {
         tx: mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
         ctx: egui::Context,
         file_name: String,
+        proxy_pdf_err: String,
     ) {
         if idx >= proxies.len() {
-            let _ = tx.send(Err("すべてのプロキシサーバーで有効なPDFデータのダウンロードに失敗しました（サイトのアクセス制限等）。".into()));
+            let _ = tx.send(Err(proxy_pdf_err));
             ctx.request_repaint();
             return;
         }
@@ -502,6 +665,7 @@ impl App {
         let tx_clone = tx.clone();
         let ctx_clone = ctx.clone();
         let file_name_clone = file_name.clone();
+        let proxy_pdf_err_clone = proxy_pdf_err.clone();
 
         ehttp::fetch(req, move |res| {
             match res {
@@ -515,11 +679,25 @@ impl App {
                         return;
                     }
                     // If not valid PDF, try next proxy
-                    Self::try_fetch_proxies(proxies_clone, idx + 1, tx_clone, ctx_clone, file_name_clone);
+                    Self::try_fetch_proxies(
+                        proxies_clone,
+                        idx + 1,
+                        tx_clone,
+                        ctx_clone,
+                        file_name_clone,
+                        proxy_pdf_err_clone,
+                    );
                 }
                 _ => {
                     // Try next proxy
-                    Self::try_fetch_proxies(proxies_clone, idx + 1, tx_clone, ctx_clone, file_name_clone);
+                    Self::try_fetch_proxies(
+                        proxies_clone,
+                        idx + 1,
+                        tx_clone,
+                        ctx_clone,
+                        file_name_clone,
+                        proxy_pdf_err_clone,
+                    );
                 }
             }
         });
@@ -528,7 +706,7 @@ impl App {
     #[allow(unused)]
     fn do_load(&mut self, bytes: Arc<[u8]>, #[allow(unused_variables)] name: String) {
         if bytes.len() < 4 || (!bytes.starts_with(b"%PDF") && !bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF")) {
-            self.status = "Error: 取得したデータが有効なPDFファイルではありません（サーバーによるアクセス制限等の可能性）".into();
+            self.status = (self.tr.error)(self.tr.invalid_pdf_data);
             return;
         }
         self.pages.clear();
@@ -536,6 +714,10 @@ impl App {
         self.copied_page = None;
         self.selected_page = None;
         self.page_count = 0;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.wasm_render_in_flight.clear();
+        }
 
         #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
@@ -558,7 +740,7 @@ impl App {
                     ctx.request_repaint();
                 });
             if let Err(e) = spawn_res {
-                self.status = format!("Error: {e}");
+                self.status = (self.tr.error)(&e.to_string());
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -567,12 +749,18 @@ impl App {
             let tx = self.tx.clone();
             let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
             let name_clone = name.clone();
+            let tr = self.tr;
 
             wasm_bindgen_futures::spawn_local(async move {
                 let res = get_pdf_info_js(bytes_js, doc_gen).await;
                 if let Ok(err_val) = js_sys::Reflect::get(&res, &"error".into()) {
                     if !err_val.is_null() && !err_val.is_undefined() {
-                        let err_str = err_val.as_string().unwrap_or_else(|| "PDFの解析・構造チェックに失敗しました".into());
+                        let mut err_str = err_val
+                            .as_string()
+                            .unwrap_or_else(|| tr.pdf_parse_failed.into());
+                        if err_str == "__PDF_PARSE_FAILED__" {
+                            err_str = tr.pdf_parse_failed.into();
+                        }
                         let _ = tx.send(AppMsg::PdfError { doc_gen, error: err_str });
                         ctx.request_repaint();
                         return;
@@ -715,10 +903,9 @@ impl App {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let bytes = match &self.pdf_bytes {
-                Some(b) => Arc::clone(b),
-                None => return,
-            };
+            if self.pdf_bytes.is_none() {
+                return;
+            }
             let ctx = ctx.clone();
             let copy_tx = self.copy_tx.clone();
             let tr = self.tr;
@@ -728,14 +915,21 @@ impl App {
 
             self.status = tr.copying.replace("\n", " ");
             wasm_bindgen_futures::spawn_local(async move {
-                let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                let res = render_pdf_page_js(bytes_js, page_num as u32, dpi, doc_gen).await;
-                let msg = match parse_js_image(res) {
-                    Ok(img) => match platform::clipboard_set_web(&img).await {
-                        Ok(()) => CopyMsg::Done {
-                            doc_gen,
-                            copy_gen,
-                            page: page_num,
+                let bytes_js = empty_pdf_data_js();
+                let msg = match render_pdf_page_js(bytes_js, page_num as u32, dpi, doc_gen).await {
+                    Ok(res) => match parse_js_image(res) {
+                        Ok(img) => match platform::clipboard_set_web(&img).await {
+                            Ok(()) => CopyMsg::Done {
+                                doc_gen,
+                                copy_gen,
+                                page: page_num,
+                            },
+                            Err(error) => CopyMsg::Failed {
+                                doc_gen,
+                                copy_gen,
+                                page: page_num,
+                                error,
+                            },
                         },
                         Err(error) => CopyMsg::Failed {
                             doc_gen,
@@ -748,7 +942,7 @@ impl App {
                         doc_gen,
                         copy_gen,
                         page: page_num,
-                        error,
+                        error: js_error_to_string(error),
                     },
                 };
                 let _ = copy_tx.send(msg);
@@ -841,7 +1035,7 @@ impl App {
                 });
             if let Err(e) = spawn_res {
                 self.pages[page_num].copy_state = CopyState::Idle;
-                self.status = format!("Error: {e}");
+                self.status = (self.tr.error)(&e.to_string());
             }
         }
     }
@@ -948,33 +1142,80 @@ impl eframe::App for App {
         // --- WASM: On-demand thumbnail rendering (via PDF.js) ---
         #[cfg(target_arch = "wasm32")]
         {
-            let mut target = None;
-            for i in 0..self.pages.len() {
-                if self.pages[i].img.is_none() {
-                    target = Some(i);
+            let max_thumbnail_renders = wasm_thumbnail_parallelism();
+            while self.wasm_render_in_flight.len() < max_thumbnail_renders {
+                let mut target = None;
+                let n_pages = self.pages.len();
+                if n_pages == 0 {
                     break;
                 }
-            }
-            if let Some(i) = target {
+
+                let center = self.selected_page.unwrap_or(0).min(n_pages - 1);
+                if is_wasm_render_candidate(&self.pages, &self.wasm_render_in_flight, center) {
+                    target = Some(center);
+                }
+                for offset in 1..n_pages {
+                    if center >= offset {
+                        let i = center - offset;
+                        if is_wasm_render_candidate(&self.pages, &self.wasm_render_in_flight, i) {
+                            target = Some(i);
+                        }
+                    }
+                    if target.is_none() && center + offset < n_pages {
+                        let i = center + offset;
+                        if is_wasm_render_candidate(&self.pages, &self.wasm_render_in_flight, i) {
+                            target = Some(i);
+                        }
+                    }
+                    if target.is_some() {
+                        break;
+                    }
+                }
+
+                let Some(i) = target else {
+                    break;
+                };
+
                 // Set a placeholder to avoid re-triggering
                 self.pages[i].img = Some(egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT));
+                self.wasm_render_in_flight.push(i);
 
                 let tx = self.tx.clone();
                 let ctx = ctx.clone();
-                let bytes = Arc::clone(self.pdf_bytes.as_ref().unwrap());
                 let render_gen = self.render_gen.load(Ordering::Relaxed);
                 let doc_gen = self.doc_gen.load(Ordering::Relaxed);
+                let thumb_cache_size = self.thumb_cache_size as f32;
                 wasm_bindgen_futures::spawn_local(async move {
-                    let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                    let res = render_pdf_page_js(bytes_js, i as u32, 100.0, doc_gen).await;
-                    if let Ok(img) = parse_js_image(res) {
-                        let _ = tx.send(AppMsg::Rendered {
-                            render_gen,
-                            page: i,
-                            img,
-                            is_full_res: false,
-                        });
-                        ctx.request_repaint();
+                    let bytes_js = empty_pdf_data_js();
+                    match render_pdf_page_fit_js(bytes_js, i as u32, thumb_cache_size, doc_gen).await {
+                        Ok(res) => {
+                            match parse_js_image(res) {
+                                Ok(img) => {
+                                    let _ = tx.send(AppMsg::Rendered {
+                                        render_gen,
+                                        page: i,
+                                        img,
+                                        is_full_res: false,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(AppMsg::RenderFailed {
+                                        render_gen,
+                                        page: i,
+                                        error,
+                                    });
+                                }
+                            }
+                            ctx.request_repaint();
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AppMsg::RenderFailed {
+                                render_gen,
+                                page: i,
+                                error: js_error_to_string(err),
+                            });
+                            ctx.request_repaint();
+                        }
                     }
                 });
             }
@@ -1001,14 +1242,14 @@ impl eframe::App for App {
                     self.load_pdf_path(path);
                 } else {
                     eprintln!("Ignoring file with extension: '{}'", ext);
-                    self.status = format!("Ignored non-PDF file: {}", f.name);
+                    self.status = (self.tr.status_ignored_non_pdf)(&f.name);
                 }
             } else if let Some(bytes) = &f.bytes {
                 eprintln!("Loading from dropped bytes ({} bytes)", bytes.len());
                 self.load_pdf_bytes(bytes.to_vec().into(), Some(&f.name));
             } else {
                 eprintln!("Dropped file has no path or bytes");
-                self.status = format!("Dropped file has no path/data: {}", f.name);
+                self.status = (self.tr.status_dropped_no_data)(&f.name);
             }
         }
 
@@ -1041,7 +1282,7 @@ impl eframe::App for App {
                             && i < self.pages.len()
                         {
                             self.pages[i].copy_state = CopyState::Idle;
-                            self.status = format!("Error: {error}");
+                            self.status = (self.tr.error)(&error);
                         }
                     }
                 }
@@ -1078,6 +1319,10 @@ impl eframe::App for App {
                         img,
                         is_full_res: is_full,
                     } => {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            self.wasm_render_in_flight.retain(|&page| page != i);
+                        }
                         if render_gen == self.render_gen.load(Ordering::Relaxed)
                             && i < self.pages.len()
                         {
@@ -1092,7 +1337,10 @@ impl eframe::App for App {
                             }
                             #[cfg(target_arch = "wasm32")]
                             {
-                                self.pages[i].img = Some(img.clone());
+                                self.pages[i].img = Some(egui::ColorImage::new(
+                                    [1, 1],
+                                    egui::Color32::TRANSPARENT,
+                                ));
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
@@ -1109,12 +1357,16 @@ impl eframe::App for App {
                         page: i,
                         error,
                     } => {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            self.wasm_render_in_flight.retain(|&page| page != i);
+                        }
                         if render_gen == self.render_gen.load(Ordering::Relaxed)
                             && i < self.pages.len()
                         {
                             self.pages[i].tex = None;
                             self.pages[i].render_error = Some(error.clone());
-                            self.status = format!("Page {} render failed: {error}", i + 1);
+                            self.status = (self.tr.status_render_failed)(i + 1, &error);
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]
@@ -1151,11 +1403,11 @@ impl eframe::App for App {
                                     loaded.name,
                                     (self.tr.pages_count)(loaded.page_count)
                                 );
-                                self.spawn_render(loaded.page_count, self.thumb_size);
+                                self.spawn_render(loaded.page_count, self.thumb_cache_size);
                             }
                             Err(e) => {
                                 eprintln!("PDF load error: {}", e);
-                                self.status = e;
+                                self.status = (self.tr.error)(&e);
                             }
                         }
                     }
@@ -1176,6 +1428,7 @@ impl eframe::App for App {
                         self.page_count = page_count;
                         self.page_aspect = aspect;
                         self.selected_page = Some(0);
+                        self.wasm_render_in_flight.clear();
                         self.pages = (0..page_count)
                             .map(|_| PageSlot {
                                 tex: None,
@@ -1190,7 +1443,7 @@ impl eframe::App for App {
                     #[cfg(target_arch = "wasm32")]
                     AppMsg::PdfError { doc_gen, error } => {
                         if doc_gen == self.doc_gen.load(Ordering::Relaxed) {
-                            self.status = format!("エラー: {}", error);
+                            self.status = (self.tr.error)(&error);
                         }
                     }
                 }
@@ -1201,13 +1454,24 @@ impl eframe::App for App {
             }
         }
         // Repaint if we still have pages that haven't even finished pass 1
-        if self.page_count > 0
+        let has_pending_render = self.page_count > 0
             && self
                 .pages
                 .iter()
-                .any(|p| p.tex.is_none() && p.render_error.is_none())
+                .any(|p| p.tex.is_none() && p.render_error.is_none());
+        #[cfg(target_arch = "wasm32")]
         {
-            ctx.request_repaint();
+            if has_pending_render
+                && self.wasm_render_in_flight.len() < wasm_thumbnail_parallelism()
+            {
+                ctx.request_repaint();
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if has_pending_render {
+                ctx.request_repaint();
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {

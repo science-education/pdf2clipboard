@@ -28,55 +28,173 @@
     <script>
         const pdfjsLib = window['pdfjs-dist/build/pdf'];
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        const PDFJS_DIST_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/';
 
         let cachedPdfDoc = null;
         let cachedDocGen = -1;
+        let activeDocGen = -1;
+        const THUMBNAIL_RENDER_TIMEOUT_MS = 15000;
+        const COPY_RENDER_TIMEOUT_MS = 60000;
+
+        function get_thumbnail_cache_size_js() {
+            const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+            const deviceMemoryGb = typeof navigator.deviceMemory === 'number'
+                ? navigator.deviceMemory
+                : null;
+
+            let size = 200;
+            if (deviceMemoryGb !== null) {
+                if (deviceMemoryGb <= 2) {
+                    size = 120;
+                } else if (deviceMemoryGb <= 4) {
+                    size = 160;
+                } else if (deviceMemoryGb <= 8) {
+                    size = 200;
+                } else {
+                    size = 320;
+                }
+            }
+
+            const memory = performance && performance.memory ? performance.memory : null;
+            if (memory) {
+                const freeBytes = memory.jsHeapSizeLimit - memory.usedJSHeapSize;
+                const freeMb = freeBytes / (1024 * 1024);
+                if (freeMb < 256) {
+                    size = Math.min(size, 80);
+                } else if (freeMb < 512) {
+                    size = Math.min(size, 120);
+                } else if (freeMb < 1024) {
+                    size = Math.min(size, 160);
+                } else if (freeMb < 2048) {
+                    size = Math.min(size, 200);
+                }
+            }
+
+            return clamp(size, 80, 320);
+        }
+
+        function destroy_cached_pdf(reason) {
+            if (!cachedPdfDoc) {
+                cachedDocGen = -1;
+                return;
+            }
+            const oldPdfDoc = cachedPdfDoc;
+            cachedPdfDoc = null;
+            cachedDocGen = -1;
+            try {
+                oldPdfDoc.destroy().catch((e) => console.warn(`PDF.js ${reason} destroy warning:`, e));
+            } catch (e) { console.warn(`PDF.js ${reason} destroy warning:`, e); }
+        }
+
+        function cancel_pdf_js(doc_gen) {
+            if (doc_gen > activeDocGen) {
+                activeDocGen = doc_gen;
+            }
+            destroy_cached_pdf("cancel");
+        }
 
         async function get_doc(pdf_data, doc_gen) {
+            if (doc_gen < activeDocGen) {
+                throw new Error("stale PDF render request ignored");
+            }
             if (cachedPdfDoc && cachedDocGen === doc_gen) {
                 return cachedPdfDoc;
             }
-            if (cachedPdfDoc) {
-                try {
-                    await cachedPdfDoc.destroy();
-                } catch (e) { console.warn("PDF.js destroy warning:", e); }
-                cachedPdfDoc = null;
+            if (!pdf_data || pdf_data.length === 0) {
+                throw new Error("PDF document is not cached");
             }
-            const loadingTask = pdfjsLib.getDocument({data: pdf_data});
-            cachedPdfDoc = await loadingTask.promise;
+            activeDocGen = doc_gen;
+            if (cachedPdfDoc) {
+                destroy_cached_pdf("replace");
+            }
+            const loadingTask = pdfjsLib.getDocument({
+                data: pdf_data,
+                cMapUrl: `${PDFJS_DIST_BASE}cmaps/`,
+                cMapPacked: true,
+                standardFontDataUrl: `${PDFJS_DIST_BASE}standard_fonts/`,
+                disableFontFace: false,
+                useSystemFonts: true
+            });
+            const pdf = await loadingTask.promise;
+            if (doc_gen < activeDocGen) {
+                try {
+                    pdf.destroy().catch((e) => console.warn("PDF.js stale destroy warning:", e));
+                } catch (e) { console.warn("PDF.js stale destroy warning:", e); }
+                throw new Error("stale PDF load ignored");
+            }
+            cachedPdfDoc = pdf;
             cachedDocGen = doc_gen;
             return cachedPdfDoc;
         }
 
-        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
+        async function render_pdf_page_at_scale(pdf_data, page_num, scale, doc_gen, timeout_ms) {
+            let page = null;
+            let timeoutId = null;
+            let renderTask = null;
             try {
                 const pdf = await get_doc(pdf_data, doc_gen);
-                const page = await pdf.getPage(page_num + 1);
-                
-                const scale = dpi / 72.0;
+                page = await pdf.getPage(page_num + 1);
                 const viewport = page.getViewport({ scale });
                 
                 const canvas = document.createElement('canvas');
                 const context = canvas.getContext('2d');
-                canvas.width = Math.floor(viewport.width);
-                canvas.height = Math.floor(viewport.height);
+                canvas.width = Math.max(1, Math.floor(viewport.width));
+                canvas.height = Math.max(1, Math.floor(viewport.height));
                 
                 const renderContext = {
                     canvasContext: context,
                     viewport: viewport
                 };
-                await page.render(renderContext).promise;
+                renderTask = page.render(renderContext);
+                await Promise.race([
+                    renderTask.promise,
+                    new Promise((_, reject) => {
+                        timeoutId = window.setTimeout(() => {
+                            try {
+                                renderTask.cancel();
+                            } catch (e) { console.warn("PDF.js render cancel warning:", e); }
+                            reject(new Error(`PDF page ${page_num + 1} render timed out`));
+                        }, timeout_ms);
+                    })
+                ]);
                 
                 const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                canvas.width = 0;
+                canvas.height = 0;
                 return {
-                    width: canvas.width,
-                    height: canvas.height,
+                    width: imageData.width,
+                    height: imageData.height,
                     data: new Uint8Array(imageData.data.buffer)
                 };
             } catch (e) {
                 console.error("PDF.js Render Error:", e);
                 throw e;
+            } finally {
+                if (timeoutId !== null) {
+                    window.clearTimeout(timeoutId);
+                }
+                if (page) {
+                    try {
+                        page.cleanup();
+                    } catch (e) { console.warn("PDF.js page cleanup warning:", e); }
+                }
             }
+        }
+
+        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
+            return render_pdf_page_at_scale(pdf_data, page_num, dpi / 72.0, doc_gen, COPY_RENDER_TIMEOUT_MS);
+        }
+
+        async function render_pdf_page_fit_js(pdf_data, page_num, max_size, doc_gen) {
+            const pdf = await get_doc(pdf_data, doc_gen);
+            const page = await pdf.getPage(page_num + 1);
+            const viewport = page.getViewport({ scale: 1.0 });
+            try {
+                page.cleanup();
+            } catch (e) { console.warn("PDF.js fit page cleanup warning:", e); }
+            const longest = Math.max(viewport.width, viewport.height, 1);
+            const scale = Math.max(1, max_size) / longest;
+            return render_pdf_page_at_scale(pdf_data, page_num, scale, doc_gen, THUMBNAIL_RENDER_TIMEOUT_MS);
         }
 
         async function get_pdf_info_js(pdf_data, doc_gen) {
@@ -92,6 +210,9 @@
                     const vp = page.getViewport({scale: 1.0});
                     totalAspect += vp.width / vp.height;
                     count++;
+                    try {
+                        page.cleanup();
+                    } catch (e) { console.warn("PDF.js info page cleanup warning:", e); }
                 }
                 
                 return {
@@ -104,13 +225,16 @@
                 return {
                     numPages: 0,
                     avgAspect: 0.707,
-                    error: e ? (e.message || e.toString()) : "PDFの解析に失敗しました（データ破損またはアクセス制限の可能性）。"
+                    error: e ? (e.message || e.toString()) : "__PDF_PARSE_FAILED__"
                 };
             }
         }
 
         window.render_pdf_page_js = render_pdf_page_js;
+        window.render_pdf_page_fit_js = render_pdf_page_fit_js;
         window.get_pdf_info_js = get_pdf_info_js;
+        window.cancel_pdf_js = cancel_pdf_js;
+        window.get_thumbnail_cache_size_js = get_thumbnail_cache_size_js;
     </script>
     <!-- Trunk will inject the wasm glue script here -->
 </body>

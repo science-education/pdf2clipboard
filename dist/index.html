@@ -19,7 +19,7 @@
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="/pdf2clipboard-37aaa334c805ee12.js" crossorigin="anonymous" integrity="sha384-NuTqx5riTArEP60Jsn1nlevZIStXrdesdbPDI1o/LT6tOuIZnRecRLQunOY6p2KR"><link rel="preload" href="/pdf2clipboard-37aaa334c805ee12_bg.wasm" crossorigin="anonymous" integrity="sha384-gD/+orDHJj0yk0WuvcVMtjfYYYdffFdWZa7QrEgCtHrzbt4K2kMwLqTLZMzUl4dY" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pdf2clipboard-bcea3d45b622f1bc.js" crossorigin="anonymous" integrity="sha384-/ZLEYYOx4kxAhFikf1Zo9nQJTpsuScqAlZRjJnSEXf/AGmICCnrDHvy4EwjpCsxN"><link rel="preload" href="/pdf2clipboard-bcea3d45b622f1bc_bg.wasm" crossorigin="anonymous" integrity="sha384-dA/ZiRsgJskrwjKlOGdTNm4CNzxnBZPSWeGnTWM1/xafEQ1Jxnz1eAm9X+ebRL39" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
     
@@ -28,55 +28,173 @@
     <script>
         const pdfjsLib = window['pdfjs-dist/build/pdf'];
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        const PDFJS_DIST_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/';
 
         let cachedPdfDoc = null;
         let cachedDocGen = -1;
+        let activeDocGen = -1;
+        const THUMBNAIL_RENDER_TIMEOUT_MS = 15000;
+        const COPY_RENDER_TIMEOUT_MS = 60000;
+
+        function get_thumbnail_cache_size_js() {
+            const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+            const deviceMemoryGb = typeof navigator.deviceMemory === 'number'
+                ? navigator.deviceMemory
+                : null;
+
+            let size = 200;
+            if (deviceMemoryGb !== null) {
+                if (deviceMemoryGb <= 2) {
+                    size = 120;
+                } else if (deviceMemoryGb <= 4) {
+                    size = 160;
+                } else if (deviceMemoryGb <= 8) {
+                    size = 200;
+                } else {
+                    size = 320;
+                }
+            }
+
+            const memory = performance && performance.memory ? performance.memory : null;
+            if (memory) {
+                const freeBytes = memory.jsHeapSizeLimit - memory.usedJSHeapSize;
+                const freeMb = freeBytes / (1024 * 1024);
+                if (freeMb < 256) {
+                    size = Math.min(size, 80);
+                } else if (freeMb < 512) {
+                    size = Math.min(size, 120);
+                } else if (freeMb < 1024) {
+                    size = Math.min(size, 160);
+                } else if (freeMb < 2048) {
+                    size = Math.min(size, 200);
+                }
+            }
+
+            return clamp(size, 80, 320);
+        }
+
+        function destroy_cached_pdf(reason) {
+            if (!cachedPdfDoc) {
+                cachedDocGen = -1;
+                return;
+            }
+            const oldPdfDoc = cachedPdfDoc;
+            cachedPdfDoc = null;
+            cachedDocGen = -1;
+            try {
+                oldPdfDoc.destroy().catch((e) => console.warn(`PDF.js ${reason} destroy warning:`, e));
+            } catch (e) { console.warn(`PDF.js ${reason} destroy warning:`, e); }
+        }
+
+        function cancel_pdf_js(doc_gen) {
+            if (doc_gen > activeDocGen) {
+                activeDocGen = doc_gen;
+            }
+            destroy_cached_pdf("cancel");
+        }
 
         async function get_doc(pdf_data, doc_gen) {
+            if (doc_gen < activeDocGen) {
+                throw new Error("stale PDF render request ignored");
+            }
             if (cachedPdfDoc && cachedDocGen === doc_gen) {
                 return cachedPdfDoc;
             }
-            if (cachedPdfDoc) {
-                try {
-                    await cachedPdfDoc.destroy();
-                } catch (e) { console.warn("PDF.js destroy warning:", e); }
-                cachedPdfDoc = null;
+            if (!pdf_data || pdf_data.length === 0) {
+                throw new Error("PDF document is not cached");
             }
-            const loadingTask = pdfjsLib.getDocument({data: pdf_data});
-            cachedPdfDoc = await loadingTask.promise;
+            activeDocGen = doc_gen;
+            if (cachedPdfDoc) {
+                destroy_cached_pdf("replace");
+            }
+            const loadingTask = pdfjsLib.getDocument({
+                data: pdf_data,
+                cMapUrl: `${PDFJS_DIST_BASE}cmaps/`,
+                cMapPacked: true,
+                standardFontDataUrl: `${PDFJS_DIST_BASE}standard_fonts/`,
+                disableFontFace: false,
+                useSystemFonts: true
+            });
+            const pdf = await loadingTask.promise;
+            if (doc_gen < activeDocGen) {
+                try {
+                    pdf.destroy().catch((e) => console.warn("PDF.js stale destroy warning:", e));
+                } catch (e) { console.warn("PDF.js stale destroy warning:", e); }
+                throw new Error("stale PDF load ignored");
+            }
+            cachedPdfDoc = pdf;
             cachedDocGen = doc_gen;
             return cachedPdfDoc;
         }
 
-        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
+        async function render_pdf_page_at_scale(pdf_data, page_num, scale, doc_gen, timeout_ms) {
+            let page = null;
+            let timeoutId = null;
+            let renderTask = null;
             try {
                 const pdf = await get_doc(pdf_data, doc_gen);
-                const page = await pdf.getPage(page_num + 1);
-                
-                const scale = dpi / 72.0;
+                page = await pdf.getPage(page_num + 1);
                 const viewport = page.getViewport({ scale });
                 
                 const canvas = document.createElement('canvas');
                 const context = canvas.getContext('2d');
-                canvas.width = Math.floor(viewport.width);
-                canvas.height = Math.floor(viewport.height);
+                canvas.width = Math.max(1, Math.floor(viewport.width));
+                canvas.height = Math.max(1, Math.floor(viewport.height));
                 
                 const renderContext = {
                     canvasContext: context,
                     viewport: viewport
                 };
-                await page.render(renderContext).promise;
+                renderTask = page.render(renderContext);
+                await Promise.race([
+                    renderTask.promise,
+                    new Promise((_, reject) => {
+                        timeoutId = window.setTimeout(() => {
+                            try {
+                                renderTask.cancel();
+                            } catch (e) { console.warn("PDF.js render cancel warning:", e); }
+                            reject(new Error(`PDF page ${page_num + 1} render timed out`));
+                        }, timeout_ms);
+                    })
+                ]);
                 
                 const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                canvas.width = 0;
+                canvas.height = 0;
                 return {
-                    width: canvas.width,
-                    height: canvas.height,
+                    width: imageData.width,
+                    height: imageData.height,
                     data: new Uint8Array(imageData.data.buffer)
                 };
             } catch (e) {
                 console.error("PDF.js Render Error:", e);
                 throw e;
+            } finally {
+                if (timeoutId !== null) {
+                    window.clearTimeout(timeoutId);
+                }
+                if (page) {
+                    try {
+                        page.cleanup();
+                    } catch (e) { console.warn("PDF.js page cleanup warning:", e); }
+                }
             }
+        }
+
+        async function render_pdf_page_js(pdf_data, page_num, dpi, doc_gen) {
+            return render_pdf_page_at_scale(pdf_data, page_num, dpi / 72.0, doc_gen, COPY_RENDER_TIMEOUT_MS);
+        }
+
+        async function render_pdf_page_fit_js(pdf_data, page_num, max_size, doc_gen) {
+            const pdf = await get_doc(pdf_data, doc_gen);
+            const page = await pdf.getPage(page_num + 1);
+            const viewport = page.getViewport({ scale: 1.0 });
+            try {
+                page.cleanup();
+            } catch (e) { console.warn("PDF.js fit page cleanup warning:", e); }
+            const longest = Math.max(viewport.width, viewport.height, 1);
+            const scale = Math.max(1, max_size) / longest;
+            return render_pdf_page_at_scale(pdf_data, page_num, scale, doc_gen, THUMBNAIL_RENDER_TIMEOUT_MS);
         }
 
         async function get_pdf_info_js(pdf_data, doc_gen) {
@@ -92,6 +210,9 @@
                     const vp = page.getViewport({scale: 1.0});
                     totalAspect += vp.width / vp.height;
                     count++;
+                    try {
+                        page.cleanup();
+                    } catch (e) { console.warn("PDF.js info page cleanup warning:", e); }
                 }
                 
                 return {
@@ -104,19 +225,22 @@
                 return {
                     numPages: 0,
                     avgAspect: 0.707,
-                    error: e ? (e.message || e.toString()) : "PDFの解析に失敗しました（データ破損またはアクセス制限の可能性）。"
+                    error: e ? (e.message || e.toString()) : "__PDF_PARSE_FAILED__"
                 };
             }
         }
 
         window.render_pdf_page_js = render_pdf_page_js;
+        window.render_pdf_page_fit_js = render_pdf_page_fit_js;
         window.get_pdf_info_js = get_pdf_info_js;
+        window.cancel_pdf_js = cancel_pdf_js;
+        window.get_thumbnail_cache_size_js = get_thumbnail_cache_size_js;
     </script>
     <!-- Trunk will inject the wasm glue script here -->
 
 <script type="module">
-import init, * as bindings from '/pdf2clipboard-37aaa334c805ee12.js';
-const wasm = await init({ module_or_path: '/pdf2clipboard-37aaa334c805ee12_bg.wasm' });
+import init, * as bindings from '/pdf2clipboard-bcea3d45b622f1bc.js';
+const wasm = await init({ module_or_path: '/pdf2clipboard-bcea3d45b622f1bc_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -124,134 +248,5 @@ window.wasmBindings = bindings;
 
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
-</script><script>"use strict";
-
-(function () {
-
-    const address = '{{__TRUNK_ADDRESS__}}';
-    const base = '{{__TRUNK_WS_BASE__}}';
-    let protocol = '';
-    protocol =
-        protocol
-            ? protocol
-            : window.location.protocol === 'https:'
-                ? 'wss'
-                : 'ws';
-    const url = protocol + '://' + address + base + '.well-known/trunk/ws';
-
-    class Overlay {
-        constructor() {
-            // create an overlay
-            this._overlay = document.createElement("div");
-            const style = this._overlay.style;
-            style.height = "100vh";
-            style.width = "100vw";
-            style.position = "fixed";
-            style.top = "0";
-            style.left = "0";
-            style.backgroundColor = "rgba(222, 222, 222, 0.5)";
-            style.fontFamily = "sans-serif";
-            // not sure that's the right approach
-            style.zIndex = "1000000";
-            style.backdropFilter = "blur(1rem)";
-
-            const container = document.createElement("div");
-            // center it
-            container.style.position = "absolute";
-            container.style.top = "30%";
-            container.style.left = "15%";
-            container.style.maxWidth = "85%";
-
-            this._title = document.createElement("div");
-            this._title.innerText = "Build failure";
-            this._title.style.paddingBottom = "2rem";
-            this._title.style.fontSize = "2.5rem";
-
-            this._message = document.createElement("div");
-            this._message.style.whiteSpace = "pre-wrap";
-
-            const icon= document.createElement("div");
-            icon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" fill="#dc3545" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>';
-            this._title.prepend(icon);
-
-            container.append(this._title, this._message);
-            this._overlay.append(container);
-
-            this._inject();
-            window.setInterval(() => {
-                this._inject();
-            }, 250);
-        }
-
-        set reason(reason) {
-            this._message.textContent = reason;
-        }
-
-        _inject() {
-            if (!this._overlay.isConnected) {
-                // prepend it
-                document.body?.prepend(this._overlay);
-            }
-        }
-
-    }
-
-    class Client {
-        constructor(url) {
-            this.url = url;
-            this.poll_interval = 5000;
-            this._overlay = null;
-        }
-
-        start() {
-            const ws = new WebSocket(this.url);
-            ws.onmessage = (ev) => {
-                const msg = JSON.parse(ev.data);
-                switch (msg.type) {
-                    case "reload":
-                        this.reload();
-                        break;
-                    case "buildFailure":
-                        this.buildFailure(msg.data)
-                        break;
-                }
-            };
-            ws.onclose = () => this.onclose();
-        }
-
-        onclose() {
-            window.setTimeout(
-                () => {
-                    // when we successfully reconnect, we'll force a
-                    // reload (since we presumably lost connection to
-                    // trunk due to it being killed, so it will have
-                    // rebuilt on restart)
-                    const ws = new WebSocket(this.url);
-                    ws.onopen = () => window.location.reload();
-                    ws.onclose = () => this.onclose();
-                },
-                this.poll_interval);
-        }
-
-        reload() {
-            window.location.reload();
-        }
-
-        buildFailure({reason}) {
-            // also log the console
-            console.error("Build failed:", reason);
-
-            console.debug("Overlay", this._overlay);
-
-            if (!this._overlay) {
-                this._overlay = new Overlay();
-            }
-            this._overlay.reason = reason;
-        }
-    }
-
-    new Client(url).start();
-
-})()
 </script></body>
 </html>
