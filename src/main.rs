@@ -1558,7 +1558,7 @@ impl eframe::App for App {
 fn main() {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PDF Page Copier")
+            .with_title("PDF Page to Clipboard")
             .with_inner_size([960.0, 720.0])
             .with_drag_and_drop(true),
         ..Default::default()
