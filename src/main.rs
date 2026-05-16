@@ -3,8 +3,6 @@
 mod platform;
 
 use eframe::egui::{self, ColorImage, ScrollArea, TextureHandle, TextureOptions};
-#[cfg(target_arch = "wasm32")]
-use pdf_oxide::document::PdfDocument;
 #[cfg(not(target_arch = "wasm32"))]
 use pdf_oxide::{
     document::PdfDocument,
@@ -68,6 +66,7 @@ struct Tr {
     open_url: &'static str,
     downloading: &'static str,
     download_err: fn(&str) -> String,
+    #[allow(dead_code)]
     pages_count: fn(u32) -> String,
     status_copy_done: fn(usize) -> String,
 }
@@ -158,6 +157,7 @@ enum AppMsg {
         img: ColorImage,
         is_full_res: bool,
     },
+    #[allow(dead_code)]
     RenderFailed {
         render_gen: u32,
         page: usize,
@@ -364,6 +364,7 @@ impl App {
 
     fn load_pdf_path(&mut self, path: &std::path::Path) {
         eprintln!("Loading PDF path: {:?}", path);
+        #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.render_gen.fetch_add(1, Ordering::Relaxed);
         self.copy_gen.fetch_add(1, Ordering::Relaxed);
@@ -507,7 +508,9 @@ impl App {
         });
     }
 
-    fn do_load(&mut self, bytes: Arc<[u8]>, name: String) {
+    #[allow(unused)]
+    fn do_load(&mut self, bytes: Arc<[u8]>, #[allow(unused_variables)] name: String) {
+        #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.render_gen.fetch_add(1, Ordering::Relaxed);
         self.copy_gen.fetch_add(1, Ordering::Relaxed);
@@ -862,6 +865,7 @@ fn pdf_render(
     })
 }
 
+#[allow(unused)]
 fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize) {
     if w < 3 || h < 3 {
         return;
