@@ -318,12 +318,28 @@ fn setup_fonts(ctx: &egui::Context) {
 
     #[cfg(target_arch = "wasm32")]
     {
-        // On Web, we can't access local system fonts.
-        // The user should bundle a font or we use the default.
-        // For demonstration, we could use include_bytes! here if a font was available.
-        log::warn!(
-            "Japanese fonts are not bundled for Web. CJK text may not render correctly in UI."
-        );
+        log::info!("Starting asynchronous Japanese Web Font download for Wasm...");
+        let ctx_clone = ctx.clone();
+        let url = "https://cdn.jsdelivr.net/gh/googlefonts/mplus-fonts@master/fonts/ttf/Mplus1p-Regular.ttf";
+        let req = ehttp::Request::get(url);
+        ehttp::fetch(req, move |res| {
+            if let Ok(response) = res {
+                if response.ok {
+                    let mut fonts = egui::FontDefinitions::default();
+                    fonts.font_data.insert("jp".to_owned(), egui::FontData::from_owned(response.bytes));
+                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                        if let Some(v) = fonts.families.get_mut(&family) {
+                            v.insert(0, "jp".to_owned());
+                        }
+                    }
+                    ctx_clone.set_fonts(fonts);
+                    log::info!("Successfully loaded Japanese font (Mplus1p-Regular.ttf) from Web!");
+                    ctx_clone.request_repaint();
+                } else {
+                    log::error!("Failed to load Japanese font: HTTP {}", response.status);
+                }
+            }
+        });
     }
 
     ctx.set_fonts(fonts);
