@@ -173,6 +173,7 @@ enum AppMsg {
         doc_gen: u32,
         page_count: u32,
         aspect: f32,
+        name: String,
     },
 }
 
@@ -554,6 +555,7 @@ impl App {
             let ctx = self.egui_ctx.clone();
             let tx = self.tx.clone();
             let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
+            let name_clone = name.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
                 let res = get_pdf_info_js(bytes_js).await;
@@ -570,6 +572,7 @@ impl App {
                     doc_gen,
                     page_count: n,
                     aspect,
+                    name: name_clone,
                 });
                 ctx.request_repaint();
             });
@@ -1139,6 +1142,7 @@ impl eframe::App for App {
                         doc_gen,
                         page_count,
                         aspect,
+                        name,
                     } => {
                         if doc_gen != self.doc_gen.load(Ordering::Relaxed) {
                             n_recv += 1;
@@ -1159,7 +1163,7 @@ impl eframe::App for App {
                                 render_error: None,
                             })
                             .collect();
-                        self.status = format!("PDF loaded: {} pages", page_count);
+                        self.status = format!("{}{}", name, (self.tr.pages_count)(page_count));
                     }
                 }
                 n_recv += 1;
