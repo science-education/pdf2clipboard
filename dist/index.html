@@ -19,7 +19,7 @@
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="/pdf2clipboard-8d79f851d3bc0aa9.js" crossorigin="anonymous" integrity="sha384-ukeL6ItGzAshmAzpa3JFiZphNO7NwHGlDdGwfTVvUjcB/iXUD3oYrQfzn3DFrR3T"><link rel="preload" href="/pdf2clipboard-8d79f851d3bc0aa9_bg.wasm" crossorigin="anonymous" integrity="sha384-NnyhlpP1iu6XWGz4KsQN5QNKmo5pKoo4kOjn5O/YC2A8GC6UMFZBNT7dpSt9iUyu" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pdf2clipboard-1c00e3bc0e67a878.js" crossorigin="anonymous" integrity="sha384-ukeL6ItGzAshmAzpa3JFiZphNO7NwHGlDdGwfTVvUjcB/iXUD3oYrQfzn3DFrR3T"><link rel="preload" href="/pdf2clipboard-1c00e3bc0e67a878_bg.wasm" crossorigin="anonymous" integrity="sha384-UPkAu/enMtttuc1Br4IX+U965romkr2cx2D03W8Z/R1w+v9+fYzC5y/aqfMScGS1" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
     
@@ -107,8 +107,8 @@
     <!-- Trunk will inject the wasm glue script here -->
 
 <script type="module">
-import init, * as bindings from '/pdf2clipboard-8d79f851d3bc0aa9.js';
-const wasm = await init({ module_or_path: '/pdf2clipboard-8d79f851d3bc0aa9_bg.wasm' });
+import init, * as bindings from '/pdf2clipboard-1c00e3bc0e67a878.js';
+const wasm = await init({ module_or_path: '/pdf2clipboard-1c00e3bc0e67a878_bg.wasm' });
 
 
 window.wasmBindings = bindings;

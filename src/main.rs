@@ -483,7 +483,7 @@ impl App {
         file_name: String,
     ) {
         if idx >= proxies.len() {
-            let _ = tx.send(Err("すべてのCORSプロキシでのダウンロードに失敗しました。".into()));
+            let _ = tx.send(Err("すべてのプロキシサーバーで有効なPDFデータのダウンロードに失敗しました（サイトのアクセス制限等）。".into()));
             ctx.request_repaint();
             return;
         }
@@ -497,8 +497,16 @@ impl App {
         ehttp::fetch(req, move |res| {
             match res {
                 Ok(response) if response.ok => {
-                    let _ = tx_clone.send(Ok((response.bytes.into(), file_name_clone)));
-                    ctx_clone.request_repaint();
+                    let bytes = &response.bytes;
+                    // Check if response contains valid PDF magic number (%PDF)
+                    let is_pdf = bytes.len() > 4 && (bytes.starts_with(b"%PDF") || bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF"));
+                    if is_pdf {
+                        let _ = tx_clone.send(Ok((bytes.to_vec().into(), file_name_clone)));
+                        ctx_clone.request_repaint();
+                        return;
+                    }
+                    // If not valid PDF, try next proxy
+                    Self::try_fetch_proxies(proxies_clone, idx + 1, tx_clone, ctx_clone, file_name_clone);
                 }
                 _ => {
                     // Try next proxy
@@ -510,6 +518,10 @@ impl App {
 
     #[allow(unused)]
     fn do_load(&mut self, bytes: Arc<[u8]>, #[allow(unused_variables)] name: String) {
+        if bytes.len() < 4 || (!bytes.starts_with(b"%PDF") && !bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF")) {
+            self.status = "Error: 取得したデータが有効なPDFファイルではありません（サーバーによるアクセス制限等の可能性）".into();
+            return;
+        }
         #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.render_gen.fetch_add(1, Ordering::Relaxed);
