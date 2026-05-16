@@ -591,6 +591,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn spawn_render(&self, _page_count: u32, _thumb_size: u32) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -952,10 +953,9 @@ impl eframe::App for App {
                 let ctx = ctx.clone();
                 let bytes = Arc::clone(self.pdf_bytes.as_ref().unwrap());
                 let render_gen = self.render_gen.load(Ordering::Relaxed);
-                let dpi = (self.thumb_size as f32 * 0.5).max(36.0);
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes_js = js_sys::Uint8Array::from(&bytes[..]);
-                    let res = render_pdf_page_js(bytes_js, i as u32, dpi).await;
+                    let res = render_pdf_page_js(bytes_js, i as u32, 100.0).await;
                     if let Ok(img) = parse_js_image(res) {
                         let _ = tx.send(AppMsg::Rendered {
                             render_gen,
@@ -1225,12 +1225,7 @@ impl eframe::App for App {
                 );
                 self.thumb_size = (self.thumb_size / 8) * 8;
                 if self.thumb_size != old && self.pdf_bytes.is_some() {
-                    for p in &mut self.pages {
-                        p.tex = None;
-                        p.img = None;
-                        p.render_error = None;
-                    }
-                    self.spawn_render(self.page_count, self.thumb_size);
+                    // Do NOT clear textures or images! Let egui GPU scale dynamically in real-time.
                 }
                 ui.add_space(16.0);
 
