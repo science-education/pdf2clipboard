@@ -526,6 +526,12 @@ impl App {
             self.status = "Error: 取得したデータが有効なPDFファイルではありません（サーバーによるアクセス制限等の可能性）".into();
             return;
         }
+        self.pages.clear();
+        self.pdf_bytes = None;
+        self.copied_page = None;
+        self.selected_page = None;
+        self.page_count = 0;
+
         #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.render_gen.fetch_add(1, Ordering::Relaxed);

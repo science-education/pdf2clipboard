@@ -37,6 +37,13 @@
             if (cachedPdfDoc && cachedPdfData === pdf_data) {
                 return cachedPdfDoc;
             }
+            if (cachedPdfDoc) {
+                try {
+                    await cachedPdfDoc.destroy();
+                } catch (e) { console.warn("PDF.js destroy warning:", e); }
+                cachedPdfDoc = null;
+                cachedPdfData = null;
+            }
             const loadingTask = pdfjsLib.getDocument({data: pdf_data});
             cachedPdfDoc = await loadingTask.promise;
             cachedPdfData = pdf_data;
