@@ -1776,6 +1776,9 @@ impl eframe::App for App {
             } else {
                 0.0
             };
+            // Experimental horizontal-centering mode: keep the original row/column
+            // assignment, but add side space so ScrollArea::both can center edge columns.
+            let horizontal_center_pad = ((avail_w - cell_w) * 0.5).max(0.0);
             let cell_h = thumb_f + 20.0;
 
             // Keyboard navigation
@@ -1835,7 +1838,7 @@ impl eframe::App for App {
             let mut blue_border = None;
             let mut hover_rect = None;
 
-            ScrollArea::vertical().show(ui, |ui| {
+            ScrollArea::both().show(ui, |ui| {
                 // Increase scroll sensitivity (add extra scroll)
                 let extra_scroll = ui.input(|i| i.smooth_scroll_delta);
                 ui.scroll_with_delta(extra_scroll * 1.2);
@@ -1844,6 +1847,7 @@ impl eframe::App for App {
                 for row in 0..n.div_ceil(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
+                        ui.add_space(horizontal_center_pad);
                         for col in 0..cols {
                             let i = row * cols + col;
                             if i >= n {
@@ -2015,6 +2019,7 @@ impl eframe::App for App {
                                 },
                             );
                         }
+                        ui.add_space(horizontal_center_pad);
                     });
                 }
 
