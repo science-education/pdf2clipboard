@@ -94,12 +94,18 @@ struct Tr {
     drop_pdf: &'static str,
     dpi: &'static str,
     thumbnail: &'static str,
+    #[allow(dead_code)]
+    thumbnail_source: &'static str,
+    #[allow(dead_code)]
+    thumbnail_sharpness: &'static str,
     copying: &'static str,
     done: &'static str,
-    click_to_copy: &'static str,
+    double_click_to_copy: &'static str,
     url_prompt: &'static str,
     open_url: &'static str,
+    cancel_url: &'static str,
     downloading: &'static str,
+    download_cancelled: &'static str,
     #[allow(dead_code)]
     direct_path_unsupported: &'static str,
     invalid_pdf_data: &'static str,
@@ -151,17 +157,22 @@ fn app_locale() -> Option<String> {
 const TR_EN: Tr = Tr {
     is_jp: false,
     drop_pdf: "Drop a PDF file onto this window",
-    dpi: "DPI:",
-    thumbnail: "Preview:",
+    dpi: "Copy DPI:",
+    thumbnail: "Preview size:",
+    thumbnail_source: "Load size:",
+    thumbnail_sharpness: "Clarity:",
     copying: "Copying...",
     done: "Done",
-    click_to_copy: "Click\n(Enter)\nto\ncopy",
-    url_prompt: "URL:",
+    double_click_to_copy: "Double-click\n(Enter)\nto\ncopy",
+    url_prompt: "Network (URL):",
     open_url: "Load",
+    cancel_url: "Cancel",
     downloading: "Downloading...",
+    download_cancelled: "Loading cancelled.",
     direct_path_unsupported: "Direct file path access is not supported on Web. Use drag-and-drop.",
     invalid_pdf_data: "The received data is not a valid PDF file. The site may be blocking access.",
-    proxy_pdf_err: "All proxy servers failed to download valid PDF data. The site may be blocking access.",
+    proxy_pdf_err:
+        "All proxy servers failed to download valid PDF data. The site may be blocking access.",
     pdf_parse_failed: "PDF parsing or structure validation failed.",
     error: |e| format!("Error: {e}"),
     loading: |name| format!("Loading {name}..."),
@@ -176,14 +187,18 @@ const TR_EN: Tr = Tr {
 const TR_JP: Tr = Tr {
     is_jp: true,
     drop_pdf: "PDFファイルをここにドロップしてください",
-    dpi: "解像度:",
-    thumbnail: "プレビュー:",
+    dpi: "コピー解像度:",
+    thumbnail: "プレビューサイズ:",
+    thumbnail_source: "PDF読取サイズ:",
+    thumbnail_sharpness: "くっきり度:",
     copying: "COPY中",
     done: "完了",
-    click_to_copy: "クリック\n(Enter)\nすると\nコピー",
-    url_prompt: "URL:",
+    double_click_to_copy: "ダブルクリック\n(Enter)\nで\nコピー",
+    url_prompt: "ネット（URL）:",
     open_url: "開く",
+    cancel_url: "中止",
     downloading: "ダウンロード中...",
+    download_cancelled: "読み込みを中止しました。",
     direct_path_unsupported: "Web版ではファイルパスを直接開けません。ドラッグ＆ドロップを使用してください。",
     invalid_pdf_data: "取得したデータが有効なPDFファイルではありません。サーバーによるアクセス制限等の可能性があります。",
     proxy_pdf_err: "すべてのプロキシサーバーで有効なPDFデータのダウンロードに失敗しました。サイトのアクセス制限等の可能性があります。",
@@ -212,6 +227,8 @@ enum CopyState {
 struct PageSlot {
     tex: Option<TextureHandle>,
     img: Option<ColorImage>,
+    #[cfg(not(target_arch = "wasm32"))]
+    thumb_base: Option<ColorImage>,
     is_full_res: bool,
     copy_state: CopyState,
     render_error: Option<String>,
@@ -225,13 +242,30 @@ fn wasm_thumbnail_parallelism() -> usize {
     let hardware_threads = web_sys::window()
         .map(|window| window.navigator().hardware_concurrency() as usize)
         .unwrap_or(2);
-    (hardware_threads / 2)
-        .clamp(1, WASM_THUMBNAIL_RENDER_HARD_CAP)
+    (hardware_threads / 2).clamp(1, WASM_THUMBNAIL_RENDER_HARD_CAP)
 }
 
 #[cfg(target_arch = "wasm32")]
 fn is_wasm_render_candidate(pages: &[PageSlot], in_flight: &[usize], i: usize) -> bool {
     pages[i].img.is_none() && !in_flight.contains(&i)
+}
+
+fn normalize_thumb_size(size: u32) -> u32 {
+    ((size.clamp(80, 1024)) / 8) * 8
+}
+
+fn normalize_thumb_cache_size(size: u32) -> u32 {
+    ((size.clamp(80, 1024)) / 8) * 8
+}
+
+fn toolbar_group(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let row_width = ui.available_size_before_wrap().x.max(160.0);
+    let width = width.min(row_width);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add_contents,
+    );
 }
 
 #[cfg(windows)]
@@ -309,10 +343,7 @@ enum AppMsg {
         name: String,
     },
     #[cfg(target_arch = "wasm32")]
-    PdfError {
-        doc_gen: u32,
-        error: String,
-    },
+    PdfError { doc_gen: u32, error: String },
 }
 
 enum CopyMsg {
@@ -329,6 +360,8 @@ enum CopyMsg {
     },
 }
 
+type DownloadMsg = (u32, Result<(Arc<[u8]>, String), String>);
+
 struct App {
     pdf_bytes: Option<Arc<[u8]>>,
     copied_page: Option<usize>,
@@ -337,6 +370,7 @@ struct App {
     pages: Vec<PageSlot>,
     thumb_size: u32,
     thumb_cache_size: u32,
+    thumb_sharpen: f32,
     page_aspect: f32,
     dpi: f32,
     status: String,
@@ -353,14 +387,16 @@ struct App {
     doc_gen: Arc<AtomicU32>,
     #[allow(dead_code)]
     copy_gen: Arc<AtomicU32>,
+    download_gen: Arc<AtomicU32>,
     #[allow(dead_code)]
     egui_ctx: egui::Context,
     url_input: String,
     is_downloading: bool,
+    url_doc_loading: bool,
     #[cfg(target_arch = "wasm32")]
     wasm_render_in_flight: Vec<usize>,
-    download_tx: mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
-    download_rx: Arc<Mutex<mpsc::Receiver<Result<(Arc<[u8]>, String), String>>>>,
+    download_tx: mpsc::Sender<DownloadMsg>,
+    download_rx: Arc<Mutex<mpsc::Receiver<DownloadMsg>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -462,7 +498,9 @@ fn setup_fonts(ctx: &egui::Context) {
     {
         log::info!("Loading bundled Noto Sans JP 400 Regular Japanese font for Wasm...");
         let font_bytes = include_bytes!("../assets/font.ttf");
-        fonts.font_data.insert("jp".to_owned(), egui::FontData::from_static(font_bytes));
+        fonts
+            .font_data
+            .insert("jp".to_owned(), egui::FontData::from_static(font_bytes));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(v) = fonts.families.get_mut(&family) {
                 v.insert(0, "jp".to_owned());
@@ -489,9 +527,10 @@ impl App {
             pages: Vec::new(),
             thumb_size: 200,
             #[cfg(not(target_arch = "wasm32"))]
-            thumb_cache_size: desktop_thumb_cache_size(),
+            thumb_cache_size: normalize_thumb_cache_size(desktop_thumb_cache_size()),
             #[cfg(target_arch = "wasm32")]
-            thumb_cache_size: get_thumbnail_cache_size_js().clamp(80, 320),
+            thumb_cache_size: normalize_thumb_cache_size(get_thumbnail_cache_size_js()),
+            thumb_sharpen: 0.0,
             page_aspect: 0.707,
             dpi: 300.0,
             status: tr.drop_pdf.into(),
@@ -503,9 +542,11 @@ impl App {
             render_gen: Arc::new(AtomicU32::new(0)),
             doc_gen: Arc::new(AtomicU32::new(0)),
             copy_gen: Arc::new(AtomicU32::new(0)),
+            download_gen: Arc::new(AtomicU32::new(0)),
             egui_ctx: cc.egui_ctx.clone(),
             url_input: String::new(),
             is_downloading: false,
+            url_doc_loading: false,
             #[cfg(target_arch = "wasm32")]
             wasm_render_in_flight: Vec::new(),
             download_tx,
@@ -515,6 +556,9 @@ impl App {
 
     fn load_pdf_path(&mut self, path: &std::path::Path) {
         eprintln!("Loading PDF path: {:?}", path);
+        self.download_gen.fetch_add(1, Ordering::Relaxed);
+        self.is_downloading = false;
+        self.url_doc_loading = false;
         #[allow(unused_variables)]
         let doc_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.render_gen.fetch_add(1, Ordering::Relaxed);
@@ -563,6 +607,9 @@ impl App {
 
     fn load_pdf_bytes(&mut self, bytes: Arc<[u8]>, name: Option<&str>) {
         eprintln!("Loading PDF bytes: {} bytes", bytes.len());
+        self.download_gen.fetch_add(1, Ordering::Relaxed);
+        self.is_downloading = false;
+        self.url_doc_loading = false;
         let display_name = name
             .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p))
             .unwrap_or("PDF")
@@ -573,8 +620,12 @@ impl App {
 
     fn fetch_url(&mut self, url: &str) {
         let url_trimmed = url.trim().to_string();
-        if url_trimmed.is_empty() { return; }
+        if url_trimmed.is_empty() {
+            return;
+        }
+        let download_gen = self.download_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.is_downloading = true;
+        self.url_doc_loading = false;
         self.status = self.tr.downloading.into();
 
         #[cfg(target_arch = "wasm32")]
@@ -593,37 +644,43 @@ impl App {
 
         let tx = self.download_tx.clone();
         let ctx = self.egui_ctx.clone();
-        let file_name = url_trimmed.rsplit(['/', '\\', '?']).find(|s| !s.is_empty()).unwrap_or("URL_PDF").to_string();
+        let file_name = url_trimmed
+            .rsplit(['/', '\\', '?'])
+            .find(|s| !s.is_empty())
+            .unwrap_or("URL_PDF")
+            .to_string();
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             let req = ehttp::Request::get(&url_trimmed);
             ehttp::fetch(req, move |res| {
-                match res {
-                    Ok(response) if response.ok => {
-                        let _ = tx.send(Ok((response.bytes.into(), file_name)));
-                    }
+                let result = match res {
+                    Ok(response) if response.ok => Ok((response.bytes.into(), file_name)),
                     Ok(response) => {
-                        let _ = tx.send(Err(format!("HTTP {} {}", response.status, response.status_text)));
+                        Err(format!("HTTP {} {}", response.status, response.status_text))
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                    }
-                }
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send((download_gen, result));
                 ctx.request_repaint();
             });
         }
 
         #[cfg(target_arch = "wasm32")]
         {
-            if url_trimmed.starts_with("http://localhost") || url_trimmed.starts_with("http://127.0.0.1") {
+            if url_trimmed.starts_with("http://localhost")
+                || url_trimmed.starts_with("http://127.0.0.1")
+            {
                 let req = ehttp::Request::get(&url_trimmed);
                 ehttp::fetch(req, move |res| {
-                    match res {
-                        Ok(response) if response.ok => { let _ = tx.send(Ok((response.bytes.into(), file_name))); }
-                        Ok(response) => { let _ = tx.send(Err(format!("HTTP {} {}", response.status, response.status_text))); }
-                        Err(e) => { let _ = tx.send(Err(e)); }
-                    }
+                    let result = match res {
+                        Ok(response) if response.ok => Ok((response.bytes.into(), file_name)),
+                        Ok(response) => {
+                            Err(format!("HTTP {} {}", response.status, response.status_text))
+                        }
+                        Err(e) => Err(e),
+                    };
+                    let _ = tx.send((download_gen, result));
                     ctx.request_repaint();
                 });
             } else {
@@ -640,8 +697,32 @@ impl App {
                     ctx,
                     file_name,
                     self.tr.proxy_pdf_err.to_owned(),
+                    download_gen,
                 );
             }
+        }
+    }
+
+    fn cancel_url_load(&mut self) {
+        self.download_gen.fetch_add(1, Ordering::Relaxed);
+        self.is_downloading = false;
+        let cancel_document_load = self.url_doc_loading;
+        self.url_doc_loading = false;
+        self.status = self.tr.download_cancelled.into();
+
+        if cancel_document_load {
+            #[allow(unused_variables)]
+            let cancel_gen = self.doc_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            self.render_gen.fetch_add(1, Ordering::Relaxed);
+            #[cfg(target_arch = "wasm32")]
+            {
+                cancel_pdf_js(cancel_gen);
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.wasm_render_in_flight.clear();
         }
     }
 
@@ -649,13 +730,14 @@ impl App {
     fn try_fetch_proxies(
         proxies: Vec<String>,
         idx: usize,
-        tx: mpsc::Sender<Result<(Arc<[u8]>, String), String>>,
+        tx: mpsc::Sender<DownloadMsg>,
         ctx: egui::Context,
         file_name: String,
         proxy_pdf_err: String,
+        download_gen: u32,
     ) {
         if idx >= proxies.len() {
-            let _ = tx.send(Err(proxy_pdf_err));
+            let _ = tx.send((download_gen, Err(proxy_pdf_err)));
             ctx.request_repaint();
             return;
         }
@@ -672,9 +754,14 @@ impl App {
                 Ok(response) if response.ok => {
                     let bytes = &response.bytes;
                     // Check if response contains valid PDF magic number (%PDF)
-                    let is_pdf = bytes.len() > 4 && (bytes.starts_with(b"%PDF") || bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF"));
+                    let is_pdf = bytes.len() > 4
+                        && (bytes.starts_with(b"%PDF")
+                            || bytes[..bytes.len().min(1024)]
+                                .windows(4)
+                                .any(|w| w == b"%PDF"));
                     if is_pdf {
-                        let _ = tx_clone.send(Ok((bytes.to_vec().into(), file_name_clone)));
+                        let _ = tx_clone
+                            .send((download_gen, Ok((bytes.to_vec().into(), file_name_clone))));
                         ctx_clone.request_repaint();
                         return;
                     }
@@ -686,6 +773,7 @@ impl App {
                         ctx_clone,
                         file_name_clone,
                         proxy_pdf_err_clone,
+                        download_gen,
                     );
                 }
                 _ => {
@@ -697,6 +785,7 @@ impl App {
                         ctx_clone,
                         file_name_clone,
                         proxy_pdf_err_clone,
+                        download_gen,
                     );
                 }
             }
@@ -705,7 +794,14 @@ impl App {
 
     #[allow(unused)]
     fn do_load(&mut self, bytes: Arc<[u8]>, #[allow(unused_variables)] name: String) {
-        if bytes.len() < 4 || (!bytes.starts_with(b"%PDF") && !bytes[..bytes.len().min(1024)].windows(4).any(|w| w == b"%PDF")) {
+        if bytes.len() < 4
+            || (!bytes.starts_with(b"%PDF")
+                && !bytes[..bytes.len().min(1024)]
+                    .windows(4)
+                    .any(|w| w == b"%PDF"))
+        {
+            self.is_downloading = false;
+            self.url_doc_loading = false;
             self.status = (self.tr.error)(self.tr.invalid_pdf_data);
             return;
         }
@@ -761,7 +857,10 @@ impl App {
                         if err_str == "__PDF_PARSE_FAILED__" {
                             err_str = tr.pdf_parse_failed.into();
                         }
-                        let _ = tx.send(AppMsg::PdfError { doc_gen, error: err_str });
+                        let _ = tx.send(AppMsg::PdfError {
+                            doc_gen,
+                            error: err_str,
+                        });
                         ctx.request_repaint();
                         return;
                     }
@@ -881,6 +980,49 @@ impl App {
             // using request_animation_frame or simply processing a few per frame.
             // A more robust way is to use Web Workers, but that requires more setup.
             log::info!("Starting single-threaded rendering for Wasm");
+        }
+    }
+
+    fn rerender_thumbnails(&mut self) {
+        if self.pdf_bytes.is_none() || self.page_count == 0 {
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.render_gen.fetch_add(1, Ordering::Relaxed);
+            self.wasm_render_in_flight.clear();
+        }
+        for page in &mut self.pages {
+            page.tex = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                page.thumb_base = None;
+            }
+            page.render_error = None;
+            #[cfg(target_arch = "wasm32")]
+            {
+                page.img = None;
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.spawn_render(self.page_count, self.thumb_cache_size);
+        }
+    }
+
+    fn rebuild_thumbnail_textures(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            self.rerender_thumbnails();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        for (i, page) in self.pages.iter_mut().enumerate() {
+            let Some(base) = &page.thumb_base else {
+                continue;
+            };
+            let img = thumbnail_image_with_sharpen(base, self.thumb_sharpen);
+            page.tex = Some(ctx.load_texture(format!("p{i}"), img, TextureOptions::LINEAR));
         }
     }
 
@@ -1088,27 +1230,26 @@ fn pdf_render(
         })
         .collect();
 
-    // Fast sharpening for thumbnails. Copy rendering passes a DPI; thumbnails use fit size.
-    if dpi.is_none() {
-        sharpen_image(&mut pixels, w, h);
-    }
-
     Ok(ColorImage {
         size: [w, h],
         pixels,
     })
 }
 
+fn thumbnail_image_with_sharpen(base: &ColorImage, amount: f32) -> ColorImage {
+    let mut img = base.clone();
+    sharpen_image(&mut img.pixels, img.size[0], img.size[1], amount);
+    img
+}
+
 #[allow(unused)]
-fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize) {
-    if w < 3 || h < 3 {
+fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize, amount: f32) {
+    if w < 3 || h < 3 || amount <= 0.0 {
         return;
     }
+    let amount = amount.clamp(0.0, 1.5);
     let original = pixels.to_vec();
-    // Simple 3x3 sharpening kernel:
-    // [ 0, -1,  0]
-    // [-1,  5, -1]
-    // [ 0, -1,  0]
+    // Unsharp 4-neighbor kernel. amount=1.0 matches the previous fixed kernel.
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let idx = y * w + x;
@@ -1119,8 +1260,10 @@ fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize) {
             let right = original[y * w + x + 1];
 
             let sharpen = |c1: u8, c2: u8, c3: u8, c4: u8, c5: u8| -> u8 {
-                let val = 5 * (c1 as i32) - (c2 as i32) - (c3 as i32) - (c4 as i32) - (c5 as i32);
-                val.clamp(0, 255) as u8
+                let center = c1 as f32;
+                let neighbors = c2 as f32 + c3 as f32 + c4 as f32 + c5 as f32;
+                let val = center * (1.0 + 4.0 * amount) - neighbors * amount;
+                val.round().clamp(0.0, 255.0) as u8
             };
 
             pixels[idx] = egui::Color32::from_rgba_unmultiplied(
@@ -1187,7 +1330,9 @@ impl eframe::App for App {
                 let thumb_cache_size = self.thumb_cache_size as f32;
                 wasm_bindgen_futures::spawn_local(async move {
                     let bytes_js = empty_pdf_data_js();
-                    match render_pdf_page_fit_js(bytes_js, i as u32, thumb_cache_size, doc_gen).await {
+                    match render_pdf_page_fit_js(bytes_js, i as u32, thumb_cache_size, doc_gen)
+                        .await
+                    {
                         Ok(res) => {
                             match parse_js_image(res) {
                                 Ok(img) => {
@@ -1292,17 +1437,25 @@ impl eframe::App for App {
         // Receive downloaded PDF bytes
         let mut downloaded_data = None;
         if let Ok(rx) = self.download_rx.try_lock() {
-            if let Ok(res) = rx.try_recv() {
-                downloaded_data = Some(res);
+            while let Ok((download_gen, res)) = rx.try_recv() {
+                if download_gen == self.download_gen.load(Ordering::Relaxed) && self.is_downloading
+                {
+                    downloaded_data = Some(res);
+                    break;
+                }
             }
         }
         if let Some(res) = downloaded_data {
-            self.is_downloading = false;
             match res {
                 Ok((bytes, name)) => {
-                    self.load_pdf_bytes(bytes, Some(&name));
+                    let display_name = name.rsplit(['/', '\\']).next().unwrap_or(&name).to_owned();
+                    self.status = (self.tr.loading)(&display_name);
+                    self.url_doc_loading = true;
+                    self.do_load(bytes, display_name);
                 }
                 Err(e) => {
+                    self.is_downloading = false;
+                    self.url_doc_loading = false;
                     self.status = (self.tr.download_err)(&e);
                 }
             }
@@ -1326,21 +1479,30 @@ impl eframe::App for App {
                         if render_gen == self.render_gen.load(Ordering::Relaxed)
                             && i < self.pages.len()
                         {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let texture_img = if is_full {
+                                img.clone()
+                            } else {
+                                self.pages[i].thumb_base = Some(img.clone());
+                                thumbnail_image_with_sharpen(&img, self.thumb_sharpen)
+                            };
+                            #[cfg(target_arch = "wasm32")]
+                            let texture_img =
+                                thumbnail_image_with_sharpen(&img, self.thumb_sharpen);
+
                             // Only update texture if it's the low-res pass (is_full == false)
                             // or if we somehow don't have a texture yet.
                             if !is_full || self.pages[i].tex.is_none() {
                                 self.pages[i].tex = Some(ctx.load_texture(
                                     format!("p{i}"),
-                                    img.clone(),
+                                    texture_img,
                                     TextureOptions::LINEAR,
                                 ));
                             }
                             #[cfg(target_arch = "wasm32")]
                             {
-                                self.pages[i].img = Some(egui::ColorImage::new(
-                                    [1, 1],
-                                    egui::Color32::TRANSPARENT,
-                                ));
+                                self.pages[i].img =
+                                    Some(egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT));
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
@@ -1383,6 +1545,8 @@ impl eframe::App for App {
                         }
                         match res {
                             Ok(loaded) => {
+                                self.is_downloading = false;
+                                self.url_doc_loading = false;
                                 eprintln!("PDF loaded successfully: {} pages", loaded.page_count);
                                 self.page_aspect = loaded.aspect;
                                 self.page_count = loaded.page_count;
@@ -1392,6 +1556,8 @@ impl eframe::App for App {
                                     .map(|_| PageSlot {
                                         tex: None,
                                         img: None,
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        thumb_base: None,
                                         is_full_res: false,
                                         copy_state: CopyState::Idle,
                                         render_error: None,
@@ -1406,6 +1572,8 @@ impl eframe::App for App {
                                 self.spawn_render(loaded.page_count, self.thumb_cache_size);
                             }
                             Err(e) => {
+                                self.is_downloading = false;
+                                self.url_doc_loading = false;
                                 eprintln!("PDF load error: {}", e);
                                 self.status = (self.tr.error)(&e);
                             }
@@ -1425,6 +1593,8 @@ impl eframe::App for App {
                             }
                             continue;
                         }
+                        self.is_downloading = false;
+                        self.url_doc_loading = false;
                         self.page_count = page_count;
                         self.page_aspect = aspect;
                         self.selected_page = Some(0);
@@ -1433,6 +1603,8 @@ impl eframe::App for App {
                             .map(|_| PageSlot {
                                 tex: None,
                                 img: None,
+                                #[cfg(not(target_arch = "wasm32"))]
+                                thumb_base: None,
                                 is_full_res: false,
                                 copy_state: CopyState::Idle,
                                 render_error: None,
@@ -1443,6 +1615,8 @@ impl eframe::App for App {
                     #[cfg(target_arch = "wasm32")]
                     AppMsg::PdfError { doc_gen, error } => {
                         if doc_gen == self.doc_gen.load(Ordering::Relaxed) {
+                            self.is_downloading = false;
+                            self.url_doc_loading = false;
                             self.status = (self.tr.error)(&error);
                         }
                     }
@@ -1461,8 +1635,7 @@ impl eframe::App for App {
                 .any(|p| p.tex.is_none() && p.render_error.is_none());
         #[cfg(target_arch = "wasm32")]
         {
-            if has_pending_render
-                && self.wasm_render_in_flight.len() < wasm_thumbnail_parallelism()
+            if has_pending_render && self.wasm_render_in_flight.len() < wasm_thumbnail_parallelism()
             {
                 ctx.request_repaint();
             }
@@ -1475,46 +1648,98 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.style_mut().spacing.item_spacing.y = 0.0;
-                ui.label(self.tr.dpi);
-                ui.add(
-                    egui::DragValue::new(&mut self.dpi)
-                        .range(72.0..=600.0f32)
-                        .speed(1.0)
-                        .suffix(" dpi"),
-                );
-                ui.add_space(16.0);
-                ui.label(self.tr.thumbnail);
+            let mut center_selected_after_resize = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.style_mut().spacing.item_spacing.y = 6.0;
+                ui.spacing_mut().slider_width = 128.0;
+
+                toolbar_group(ui, 276.0, |ui| {
+                    ui.label(self.tr.dpi);
+                    ui.add(
+                        egui::Slider::new(&mut self.dpi, 72.0..=600.0f32)
+                            .step_by(1.0)
+                            .suffix(" dpi"),
+                    );
+                });
+                self.dpi = self.dpi.round().clamp(72.0, 600.0);
+
+                ui.add_space(12.0);
                 let old = self.thumb_size;
-                ui.add(
-                    egui::DragValue::new(&mut self.thumb_size)
-                        .range(80..=512u32)
-                        .speed(8.0)
-                        .suffix(" px"),
-                );
-                self.thumb_size = (self.thumb_size / 8) * 8;
+                toolbar_group(ui, 292.0, |ui| {
+                    ui.label(self.tr.thumbnail);
+                    ui.add(
+                        egui::Slider::new(&mut self.thumb_size, 80..=1024u32)
+                            .step_by(8.0)
+                            .suffix(" px"),
+                    );
+                });
+                self.thumb_size = normalize_thumb_size(self.thumb_size);
                 if self.thumb_size != old && self.pdf_bytes.is_some() {
+                    center_selected_after_resize = self.selected_page.is_some();
                     // Do NOT clear textures or images! Let egui GPU scale dynamically in real-time.
                 }
-                ui.add_space(16.0);
 
-                ui.label(self.tr.url_prompt);
-                let url_resp = ui.add(egui::TextEdit::singleline(&mut self.url_input)
-                    .hint_text("https://...")
-                    .desired_width(180.0));
-                if ui.button(self.tr.open_url).clicked() || (url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                ui.add_space(12.0);
+                let old_source = self.thumb_cache_size;
+                toolbar_group(ui, 292.0, |ui| {
+                    ui.label(self.tr.thumbnail_source);
+                    ui.add(
+                        egui::Slider::new(&mut self.thumb_cache_size, 80..=1024u32)
+                            .step_by(8.0)
+                            .suffix(" px")
+                            .show_value(true),
+                    );
+                });
+                self.thumb_cache_size = normalize_thumb_cache_size(self.thumb_cache_size);
+                if self.thumb_cache_size != old_source {
+                    self.rerender_thumbnails();
+                }
+
+                ui.add_space(12.0);
+                let old_sharpen = self.thumb_sharpen;
+                toolbar_group(ui, 260.0, |ui| {
+                    ui.label(self.tr.thumbnail_sharpness);
+                    ui.add(
+                        egui::Slider::new(&mut self.thumb_sharpen, 0.0..=1.5)
+                            .step_by(0.05)
+                            .show_value(true),
+                    );
+                });
+                self.thumb_sharpen = (self.thumb_sharpen * 20.0).round() / 20.0;
+                if (self.thumb_sharpen - old_sharpen).abs() > f32::EPSILON {
+                    self.rebuild_thumbnail_textures(ctx);
+                }
+
+                ui.add_space(12.0);
+                let mut enter_pressed = false;
+                let mut load_clicked = false;
+                let mut cancel_clicked = false;
+                toolbar_group(ui, 360.0, |ui| {
+                    ui.label(self.tr.url_prompt);
+                    let url_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.url_input)
+                            .hint_text("https://...")
+                            .desired_width(180.0),
+                    );
+                    enter_pressed =
+                        url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if self.is_downloading {
+                        cancel_clicked = ui.button(self.tr.cancel_url).clicked();
+                    } else {
+                        load_clicked = ui.button(self.tr.open_url).clicked();
+                    }
+                    if self.is_downloading {
+                        ui.spinner();
+                    }
+                });
+                if cancel_clicked {
+                    self.cancel_url_load();
+                } else if load_clicked || enter_pressed {
                     self.fetch_url(&self.url_input.clone());
                 }
-                if self.is_downloading {
-                    ui.spinner();
-                }
-                ui.add_space(16.0);
-                ui.add_space(16.0);
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
-                });
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
             });
             ui.separator();
 
@@ -1531,6 +1756,16 @@ impl eframe::App for App {
 
             let mut clicked: Option<usize> = None;
             let n = self.page_count as usize;
+
+            let zoom_delta = ui.input(|i| i.zoom_delta());
+            if (zoom_delta - 1.0).abs() > 0.01 {
+                let old = self.thumb_size;
+                let scaled = (self.thumb_size as f32 * zoom_delta).round() as u32;
+                self.thumb_size = normalize_thumb_size(scaled);
+                if self.thumb_size != old {
+                    center_selected_after_resize = self.selected_page.is_some();
+                }
+            }
 
             let thumb_f = self.thumb_size as f32;
             let avail_w = ui.available_width();
@@ -1599,7 +1834,6 @@ impl eframe::App for App {
             let mut red_borders = Vec::new();
             let mut blue_border = None;
             let mut hover_rect = None;
-            let pointer_moved = ui.input(|i| i.pointer.delta().length_sq() > 0.0);
 
             ScrollArea::vertical().show(ui, |ui| {
                 // Increase scroll sensitivity (add extra scroll)
@@ -1655,11 +1889,10 @@ impl eframe::App for App {
                                         (resp, rect)
                                     };
 
-                                    if resp.clicked() {
+                                    if resp.double_clicked() {
                                         clicked = Some(i);
                                         self.selected_page = Some(i);
-                                    }
-                                    if resp.hovered() && pointer_moved {
+                                    } else if resp.clicked() {
                                         self.selected_page = Some(i);
                                     }
 
@@ -1675,7 +1908,7 @@ impl eframe::App for App {
                                         );
 
                                         // Show guide text
-                                        let txt = self.tr.click_to_copy;
+                                        let txt = self.tr.double_click_to_copy;
                                         let font = egui::FontId::proportional(14.0);
                                         let center = rect.center();
 
@@ -1773,7 +2006,9 @@ impl eframe::App for App {
                                     // Collect Blue border
                                     if self.selected_page == Some(i) {
                                         blue_border = Some(rect);
-                                        if scroll_to_selected {
+                                        if center_selected_after_resize {
+                                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                        } else if scroll_to_selected {
                                             ui.scroll_to_rect(rect, None);
                                         }
                                     }
