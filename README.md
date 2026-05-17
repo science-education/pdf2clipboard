@@ -1,7 +1,7 @@
 # PDF Page to Clipboard (Windows / macOS / Web)
 
 <div align="center">
-  <img src="docs/images/demo.webp" width="800" alt="動作デモンストレーション動画" />
+  <img src="docs/images/demo.png" width="800" alt="動作デモンストレーション画像" />
   <p><em>▲ 滑らかなサムネイル拡大・縮小と、ダブルクリックでの高品質クリップボード転送デモ</em></p>
 </div>
 
