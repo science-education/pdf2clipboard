@@ -1770,12 +1770,8 @@ impl eframe::App for App {
             let thumb_f = self.thumb_size as f32;
             let avail_w = ui.available_width();
             let cell_w = (thumb_f * self.page_aspect).max(20.0);
-            let cols = (avail_w / cell_w).floor().max(1.0) as usize;
-            let gap = if cols > 1 {
-                ((avail_w - cols as f32 * cell_w) / (cols - 1) as f32).max(0.0)
-            } else {
-                0.0
-            };
+            let gap = 6.0;
+            let cols = ((avail_w + gap) / (cell_w + gap)).floor().max(1.0) as usize;
             // Experimental horizontal-centering mode: keep the original row/column
             // assignment, but add side space so ScrollArea::both can center edge columns.
             let horizontal_center_pad = ((avail_w - cell_w) * 0.5).max(0.0);
