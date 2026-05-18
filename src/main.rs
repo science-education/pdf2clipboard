@@ -100,7 +100,6 @@ struct Tr {
     thumbnail_sharpness: &'static str,
     copying: &'static str,
     done: &'static str,
-    double_click_to_copy: &'static str,
     url_prompt: &'static str,
     open_url: &'static str,
     cancel_url: &'static str,
@@ -142,6 +141,14 @@ impl Tr {
             format!("Page {} not yet rendered", p)
         }
     }
+
+    fn status_selected(&self, p: usize) -> String {
+        if self.is_jp {
+            format!("ページ {} を選択中。ダブルクリックまたはEnterでコピー", p)
+        } else {
+            format!("Page {} selected. Double-click or press Enter to copy", p)
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -163,7 +170,6 @@ const TR_EN: Tr = Tr {
     thumbnail_sharpness: "Clarity:",
     copying: "Copying...",
     done: "Done",
-    double_click_to_copy: "Double-click\n(Enter)\nto\ncopy",
     url_prompt: "Network (URL):",
     open_url: "Load",
     cancel_url: "Cancel",
@@ -193,7 +199,6 @@ const TR_JP: Tr = Tr {
     thumbnail_sharpness: "くっきり度:",
     copying: "COPY中",
     done: "完了",
-    double_click_to_copy: "ダブルクリック\n(Enter)\nで\nコピー",
     url_prompt: "ネット（URL）:",
     open_url: "開く",
     cancel_url: "中止",
@@ -1793,39 +1798,50 @@ impl eframe::App for App {
                     if i.key_pressed(egui::Key::ArrowRight) {
                         let new_idx = (cur + 1).min(n - 1);
                         self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowLeft) {
                         let new_idx = cur.saturating_sub(1);
                         self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowDown) {
                         let new_idx = (cur + cols).min(n - 1);
                         self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowUp) {
                         let new_idx = cur.saturating_sub(cols);
                         self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::PageUp) {
                         let rows = (ui.available_height() / cell_h).floor().max(1.0) as usize;
-                        self.selected_page = Some(cur.saturating_sub(cols * rows));
+                        let new_idx = cur.saturating_sub(cols * rows);
+                        self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::PageDown) {
                         let rows = (ui.available_height() / cell_h).floor().max(1.0) as usize;
-                        self.selected_page = Some((cur + cols * rows).min(n - 1));
+                        let new_idx = (cur + cols * rows).min(n - 1);
+                        self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::Home) {
                         self.selected_page = Some(0);
+                        self.status = self.tr.status_selected(1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::End) {
-                        self.selected_page = Some(n - 1);
+                        let new_idx = n - 1;
+                        self.selected_page = Some(new_idx);
+                        self.status = self.tr.status_selected(new_idx + 1);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space) {
@@ -1905,63 +1921,11 @@ impl eframe::App for App {
                                         self.selected_page = Some(i);
                                     } else if resp.clicked() {
                                         self.selected_page = Some(i);
+                                        self.status = self.tr.status_selected(i + 1);
                                     }
 
                                     // Selection/Focus highlight (Unified Mouse & Keyboard)
                                     let is_selected = self.selected_page == Some(i);
-
-                                    if is_selected && self.pages[i].copy_state != CopyState::Done {
-                                        // Unified Blue highlight
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            0.0,
-                                            egui::Color32::from_rgba_unmultiplied(0, 120, 215, 100),
-                                        );
-
-                                        // Show guide text
-                                        let txt = self.tr.double_click_to_copy;
-                                        let font = egui::FontId::proportional(14.0);
-                                        let center = rect.center();
-
-                                        let mut job_w = egui::text::LayoutJob::simple(
-                                            txt.to_string(),
-                                            font.clone(),
-                                            egui::Color32::WHITE,
-                                            f32::INFINITY,
-                                        );
-                                        job_w.halign = egui::Align::Center;
-                                        let mut job_b = egui::text::LayoutJob::simple(
-                                            txt.to_string(),
-                                            font.clone(),
-                                            egui::Color32::BLACK,
-                                            f32::INFINITY,
-                                        );
-                                        job_b.halign = egui::Align::Center;
-
-                                        let galley_w = ui.fonts(|f| f.layout_job(job_w));
-                                        let galley_b = ui.fonts(|f| f.layout_job(job_b));
-                                        let text_pos = center - galley_w.rect.center().to_vec2();
-
-                                        // Draw white outline for readability
-                                        for off in [
-                                            egui::vec2(-1.0, -1.0),
-                                            egui::vec2(1.0, -1.0),
-                                            egui::vec2(-1.0, 1.0),
-                                            egui::vec2(1.0, 1.0),
-                                        ] {
-                                            ui.painter().galley(
-                                                text_pos + off,
-                                                galley_w.clone(),
-                                                egui::Color32::WHITE,
-                                            );
-                                        }
-                                        // Draw black main text
-                                        ui.painter().galley(
-                                            text_pos,
-                                            galley_b,
-                                            egui::Color32::BLACK,
-                                        );
-                                    }
 
                                     if is_selected {
                                         hover_rect = Some(rect);
