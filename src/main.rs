@@ -1772,9 +1772,15 @@ impl eframe::App for App {
             let cell_w = (thumb_f * self.page_aspect).max(20.0);
             let gap = 6.0;
             let cols = ((avail_w + gap) / (cell_w + gap)).floor().max(1.0) as usize;
-            // Experimental horizontal-centering mode: keep the original row/column
-            // assignment, but add side space so ScrollArea::both can center edge columns.
-            let horizontal_center_pad = ((avail_w - cell_w) * 0.5).max(0.0);
+            let selected_col = self.selected_page.map(|idx| idx % cols).unwrap_or(0);
+            let selected_center_x = selected_col as f32 * (cell_w + gap) + cell_w * 0.5;
+            let row_content_w = cols as f32 * cell_w + cols.saturating_sub(1) as f32 * gap;
+            // Experimental horizontal-centering mode: position the virtual row so the
+            // selected column starts at the viewport center, instead of anchoring row 1
+            // to the virtual screen's left edge.
+            let row_leading_space = (avail_w * 0.5 - selected_center_x).max(0.0);
+            let row_trailing_space =
+                (selected_center_x + avail_w * 0.5 - row_content_w).max(0.0);
             let cell_h = thumb_f + 20.0;
 
             // Keyboard navigation
@@ -1843,7 +1849,7 @@ impl eframe::App for App {
                 for row in 0..n.div_ceil(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
-                        ui.add_space(horizontal_center_pad);
+                        ui.add_space(row_leading_space);
                         for col in 0..cols {
                             let i = row * cols + col;
                             if i >= n {
@@ -2015,7 +2021,7 @@ impl eframe::App for App {
                                 },
                             );
                         }
-                        ui.add_space(horizontal_center_pad);
+                        ui.add_space(row_trailing_space);
                     });
                 }
 
