@@ -60,6 +60,30 @@ fn empty_pdf_data_js() -> js_sys::Uint8Array {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn browser_fullscreen() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.fullscreen_element())
+        .is_some()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_browser_fullscreen(fullscreen: bool) {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    if fullscreen {
+        if document.fullscreen_element().is_none() {
+            if let Some(element) = document.document_element() {
+                let _ = element.request_fullscreen();
+            }
+        }
+    } else if document.fullscreen_element().is_some() {
+        document.exit_fullscreen();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn parse_js_image(val: JsValue) -> Result<ColorImage, String> {
     let width = js_sys::Reflect::get(&val, &"width".into())
         .map_err(|e| format!("{:?}", e))?
@@ -98,6 +122,8 @@ struct Tr {
     thumbnail_source: &'static str,
     #[allow(dead_code)]
     thumbnail_sharpness: &'static str,
+    fullscreen: &'static str,
+    exit_fullscreen: &'static str,
     copying: &'static str,
     done: &'static str,
     url_prompt: &'static str,
@@ -168,6 +194,8 @@ const TR_EN: Tr = Tr {
     thumbnail: "Preview size:",
     thumbnail_source: "Load size:",
     thumbnail_sharpness: "Clarity:",
+    fullscreen: "Fullscreen",
+    exit_fullscreen: "Exit fullscreen",
     copying: "Copying...",
     done: "Done",
     url_prompt: "Network (URL):",
@@ -197,6 +225,8 @@ const TR_JP: Tr = Tr {
     thumbnail: "プレビューサイズ:",
     thumbnail_source: "PDF読取サイズ:",
     thumbnail_sharpness: "くっきり度:",
+    fullscreen: "全画面",
+    exit_fullscreen: "全画面解除",
     copying: "COPY中",
     done: "完了",
     url_prompt: "ネット（URL）:",
@@ -376,6 +406,9 @@ struct App {
     thumb_size: u32,
     thumb_cache_size: u32,
     thumb_sharpen: f32,
+    fullscreen: bool,
+    selection_flash_at: f64,
+    copy_done_flash_at: Option<(usize, f64)>,
     page_aspect: f32,
     dpi: f32,
     status: String,
@@ -536,6 +569,9 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             thumb_cache_size: normalize_thumb_cache_size(get_thumbnail_cache_size_js()),
             thumb_sharpen: 0.0,
+            fullscreen: false,
+            selection_flash_at: -10.0,
+            copy_done_flash_at: None,
             page_aspect: 0.707,
             dpi: 300.0,
             status: tr.drop_pdf.into(),
@@ -556,6 +592,21 @@ impl App {
             wasm_render_in_flight: Vec::new(),
             download_tx,
             download_rx: Arc::new(Mutex::new(download_rx)),
+        }
+    }
+
+    fn select_page(&mut self, page: usize, now: f64) {
+        self.selected_page = Some(page);
+        self.selection_flash_at = now;
+        self.status = self.tr.status_selected(page + 1);
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+        #[cfg(target_arch = "wasm32")]
+        {
+            set_browser_fullscreen(fullscreen);
         }
     }
 
@@ -1287,6 +1338,21 @@ fn sharpen_image(pixels: &mut [egui::Color32], w: usize, h: usize, amount: f32) 
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = ctx.input(|i| i.time);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.fullscreen = browser_fullscreen();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(fullscreen) = ctx.input(|i| i.viewport().fullscreen) {
+                self.fullscreen = fullscreen;
+            }
+        }
+        if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.set_fullscreen(ctx, false);
+        }
+
         // --- WASM: On-demand thumbnail rendering (via PDF.js) ---
         #[cfg(target_arch = "wasm32")]
         {
@@ -1418,6 +1484,7 @@ impl eframe::App for App {
                         {
                             self.pages[i].copy_state = CopyState::Done;
                             self.copied_page = Some(i);
+                            self.copy_done_flash_at = Some((i, now));
                             self.status = (self.tr.status_copy_done)(i + 1);
                         }
                     }
@@ -1652,101 +1719,133 @@ impl eframe::App for App {
             }
         }
 
+        let selection_alpha = (1.0 - (now - self.selection_flash_at)).clamp(0.0, 1.0) as f32;
+        if selection_alpha > 0.0 {
+            ctx.request_repaint();
+        }
+        if let Some((page, t)) = self.copy_done_flash_at {
+            let elapsed = now - t;
+            if elapsed >= 1.0 {
+                if page < self.pages.len() && self.pages[page].copy_state == CopyState::Done {
+                    self.pages[page].copy_state = CopyState::Idle;
+                }
+                self.copy_done_flash_at = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
+        if self.fullscreen {
+            egui::Area::new(egui::Id::new("fullscreen_exit_button"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .show(ctx, |ui| {
+                    if ui.button(self.tr.exit_fullscreen).clicked() {
+                        self.set_fullscreen(ctx, false);
+                    }
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut center_selected_after_resize = false;
-            ui.horizontal_wrapped(|ui| {
-                ui.style_mut().spacing.item_spacing.y = 6.0;
-                ui.spacing_mut().slider_width = 128.0;
+            if !self.fullscreen {
+                ui.horizontal_wrapped(|ui| {
+                    ui.style_mut().spacing.item_spacing.y = 6.0;
+                    ui.spacing_mut().slider_width = 128.0;
 
-                toolbar_group(ui, 276.0, |ui| {
-                    ui.label(self.tr.dpi);
-                    ui.add(
-                        egui::Slider::new(&mut self.dpi, 72.0..=600.0f32)
-                            .step_by(1.0)
-                            .suffix(" dpi"),
-                    );
-                });
-                self.dpi = self.dpi.round().clamp(72.0, 600.0);
+                    toolbar_group(ui, 276.0, |ui| {
+                        ui.label(self.tr.dpi);
+                        ui.add(
+                            egui::Slider::new(&mut self.dpi, 72.0..=600.0f32)
+                                .step_by(1.0)
+                                .suffix(" dpi"),
+                        );
+                    });
+                    self.dpi = self.dpi.round().clamp(72.0, 600.0);
 
-                ui.add_space(12.0);
-                let old = self.thumb_size;
-                toolbar_group(ui, 292.0, |ui| {
-                    ui.label(self.tr.thumbnail);
-                    ui.add(
-                        egui::Slider::new(&mut self.thumb_size, 80..=1024u32)
-                            .step_by(8.0)
-                            .suffix(" px"),
-                    );
-                });
-                self.thumb_size = normalize_thumb_size(self.thumb_size);
-                if self.thumb_size != old && self.pdf_bytes.is_some() {
-                    center_selected_after_resize = self.selected_page.is_some();
-                    // Do NOT clear textures or images! Let egui GPU scale dynamically in real-time.
-                }
-
-                ui.add_space(12.0);
-                let old_source = self.thumb_cache_size;
-                toolbar_group(ui, 292.0, |ui| {
-                    ui.label(self.tr.thumbnail_source);
-                    ui.add(
-                        egui::Slider::new(&mut self.thumb_cache_size, 80..=1024u32)
-                            .step_by(8.0)
-                            .suffix(" px")
-                            .show_value(true),
-                    );
-                });
-                self.thumb_cache_size = normalize_thumb_cache_size(self.thumb_cache_size);
-                if self.thumb_cache_size != old_source {
-                    self.rerender_thumbnails();
-                }
-
-                ui.add_space(12.0);
-                let old_sharpen = self.thumb_sharpen;
-                toolbar_group(ui, 260.0, |ui| {
-                    ui.label(self.tr.thumbnail_sharpness);
-                    ui.add(
-                        egui::Slider::new(&mut self.thumb_sharpen, 0.0..=1.5)
-                            .step_by(0.05)
-                            .show_value(true),
-                    );
-                });
-                self.thumb_sharpen = (self.thumb_sharpen * 20.0).round() / 20.0;
-                if (self.thumb_sharpen - old_sharpen).abs() > f32::EPSILON {
-                    self.rebuild_thumbnail_textures(ctx);
-                }
-
-                ui.add_space(12.0);
-                let mut enter_pressed = false;
-                let mut load_clicked = false;
-                let mut cancel_clicked = false;
-                toolbar_group(ui, 360.0, |ui| {
-                    ui.label(self.tr.url_prompt);
-                    let url_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.url_input)
-                            .hint_text("https://...")
-                            .desired_width(180.0),
-                    );
-                    enter_pressed =
-                        url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if self.is_downloading {
-                        cancel_clicked = ui.button(self.tr.cancel_url).clicked();
-                    } else {
-                        load_clicked = ui.button(self.tr.open_url).clicked();
+                    ui.add_space(12.0);
+                    let old = self.thumb_size;
+                    toolbar_group(ui, 292.0, |ui| {
+                        ui.label(self.tr.thumbnail);
+                        ui.add(
+                            egui::Slider::new(&mut self.thumb_size, 80..=1024u32)
+                                .step_by(8.0)
+                                .suffix(" px"),
+                        );
+                    });
+                    self.thumb_size = normalize_thumb_size(self.thumb_size);
+                    if self.thumb_size != old && self.pdf_bytes.is_some() {
+                        center_selected_after_resize = self.selected_page.is_some();
+                        // Do NOT clear textures or images! Let egui GPU scale dynamically in real-time.
                     }
-                    if self.is_downloading {
-                        ui.spinner();
+
+                    ui.add_space(12.0);
+                    let old_source = self.thumb_cache_size;
+                    toolbar_group(ui, 292.0, |ui| {
+                        ui.label(self.tr.thumbnail_source);
+                        ui.add(
+                            egui::Slider::new(&mut self.thumb_cache_size, 80..=1024u32)
+                                .step_by(8.0)
+                                .suffix(" px")
+                                .show_value(true),
+                        );
+                    });
+                    self.thumb_cache_size = normalize_thumb_cache_size(self.thumb_cache_size);
+                    if self.thumb_cache_size != old_source {
+                        self.rerender_thumbnails();
+                    }
+
+                    ui.add_space(12.0);
+                    let old_sharpen = self.thumb_sharpen;
+                    toolbar_group(ui, 260.0, |ui| {
+                        ui.label(self.tr.thumbnail_sharpness);
+                        ui.add(
+                            egui::Slider::new(&mut self.thumb_sharpen, 0.0..=1.5)
+                                .step_by(0.05)
+                                .show_value(true),
+                        );
+                    });
+                    self.thumb_sharpen = (self.thumb_sharpen * 20.0).round() / 20.0;
+                    if (self.thumb_sharpen - old_sharpen).abs() > f32::EPSILON {
+                        self.rebuild_thumbnail_textures(ctx);
+                    }
+
+                    ui.add_space(12.0);
+                    let mut enter_pressed = false;
+                    let mut load_clicked = false;
+                    let mut cancel_clicked = false;
+                    toolbar_group(ui, 360.0, |ui| {
+                        ui.label(self.tr.url_prompt);
+                        let url_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.url_input)
+                                .hint_text("https://...")
+                                .desired_width(180.0),
+                        );
+                        enter_pressed =
+                            url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if self.is_downloading {
+                            cancel_clicked = ui.button(self.tr.cancel_url).clicked();
+                        } else {
+                            load_clicked = ui.button(self.tr.open_url).clicked();
+                        }
+                        if self.is_downloading {
+                            ui.spinner();
+                        }
+                    });
+                    if cancel_clicked {
+                        self.cancel_url_load();
+                    } else if load_clicked || enter_pressed {
+                        self.fetch_url(&self.url_input.clone());
+                    }
+
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
+                    ui.add_space(12.0);
+                    if ui.button(self.tr.fullscreen).clicked() {
+                        self.set_fullscreen(ctx, true);
                     }
                 });
-                if cancel_clicked {
-                    self.cancel_url_load();
-                } else if load_clicked || enter_pressed {
-                    self.fetch_url(&self.url_input.clone());
-                }
-
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
-            });
-            ui.separator();
+                ui.separator();
+            }
 
             if self.page_count == 0 {
                 ui.centered_and_justified(|ui| {
@@ -1778,14 +1877,13 @@ impl eframe::App for App {
             let gap = 6.0;
             let cols = ((avail_w + gap) / (cell_w + gap)).floor().max(1.0) as usize;
             let anchor_col = cols / 2;
-            let selected_mod = self.selected_page.map(|idx| idx % cols).unwrap_or(anchor_col);
+            let selected_mod = self
+                .selected_page
+                .map(|idx| idx % cols)
+                .unwrap_or(anchor_col);
             let layout_offset = (anchor_col + cols - selected_mod) % cols;
-            let anchor_center_x = anchor_col as f32 * (cell_w + gap) + cell_w * 0.5;
-            let row_content_w = cols as f32 * cell_w + cols.saturating_sub(1) as f32 * gap;
             // Experimental centered-anchor layout: insert leading virtual slots so the
             // selected page is placed in the center column after a column-count change.
-            let row_leading_space = (avail_w * 0.5 - anchor_center_x).max(0.0);
-            let row_trailing_space = (anchor_center_x + avail_w * 0.5 - row_content_w).max(0.0);
             let cell_h = thumb_f + 20.0;
 
             // Keyboard navigation
@@ -1797,51 +1895,43 @@ impl eframe::App for App {
                 ui.input(|i| {
                     if i.key_pressed(egui::Key::ArrowRight) {
                         let new_idx = (cur + 1).min(n - 1);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowLeft) {
                         let new_idx = cur.saturating_sub(1);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowDown) {
                         let new_idx = (cur + cols).min(n - 1);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::ArrowUp) {
                         let new_idx = cur.saturating_sub(cols);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::PageUp) {
                         let rows = (ui.available_height() / cell_h).floor().max(1.0) as usize;
                         let new_idx = cur.saturating_sub(cols * rows);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::PageDown) {
                         let rows = (ui.available_height() / cell_h).floor().max(1.0) as usize;
                         let new_idx = (cur + cols * rows).min(n - 1);
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::Home) {
-                        self.selected_page = Some(0);
-                        self.status = self.tr.status_selected(1);
+                        self.select_page(0, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::End) {
                         let new_idx = n - 1;
-                        self.selected_page = Some(new_idx);
-                        self.status = self.tr.status_selected(new_idx + 1);
+                        self.select_page(new_idx, now);
                         scroll_to_selected = true;
                     }
                     if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space) {
@@ -1854,7 +1944,6 @@ impl eframe::App for App {
 
             let mut red_borders = Vec::new();
             let mut blue_border = None;
-            let mut hover_rect = None;
 
             ScrollArea::both().show(ui, |ui| {
                 // Increase scroll sensitivity (add extra scroll)
@@ -1865,13 +1954,14 @@ impl eframe::App for App {
                 for row in 0..(n + layout_offset).div_ceil(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
-                        ui.add_space(row_leading_space);
-                        for col in 0..cols {
-                            let slot = row * cols + col;
-                            if slot < layout_offset {
-                                ui.allocate_space(egui::vec2(cell_w, cell_h));
-                                continue;
-                            }
+                        let row_start_slot = row * cols;
+                        let row_end_slot = ((row + 1) * cols).min(n + layout_offset);
+                        let first_slot = row_start_slot.max(layout_offset);
+                        let row_items = row_end_slot.saturating_sub(first_slot);
+                        let row_w =
+                            row_items as f32 * cell_w + row_items.saturating_sub(1) as f32 * gap;
+                        ui.add_space(((avail_w - row_w) * 0.5).max(0.0));
+                        for slot in first_slot..row_end_slot {
                             let i = slot - layout_offset;
                             if i >= n {
                                 break;
@@ -1918,17 +2008,16 @@ impl eframe::App for App {
 
                                     if resp.double_clicked() {
                                         clicked = Some(i);
-                                        self.selected_page = Some(i);
+                                        self.select_page(i, now);
                                     } else if resp.clicked() {
-                                        self.selected_page = Some(i);
-                                        self.status = self.tr.status_selected(i + 1);
+                                        self.select_page(i, now);
                                     }
 
                                     // Selection/Focus highlight (Unified Mouse & Keyboard)
                                     let is_selected = self.selected_page == Some(i);
 
-                                    if is_selected {
-                                        hover_rect = Some(rect);
+                                    if is_selected && selection_alpha > 0.0 {
+                                        blue_border = Some((rect, selection_alpha));
                                     }
 
                                     // Status overlay text
@@ -1943,14 +2032,23 @@ impl eframe::App for App {
                                             );
                                         }
                                         CopyState::Done => {
-                                            ui.painter().text(
-                                                rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                self.tr.done,
-                                                egui::FontId::proportional(20.0),
-                                                egui::Color32::WHITE,
-                                            );
-                                            red_borders.push(rect);
+                                            let alpha = self
+                                                .copy_done_flash_at
+                                                .filter(|(page, _)| *page == i)
+                                                .map(|(_, t)| {
+                                                    (1.0 - (now - t)).clamp(0.0, 1.0) as f32
+                                                })
+                                                .unwrap_or(0.0);
+                                            if alpha > 0.0 {
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    self.tr.done,
+                                                    egui::FontId::proportional(20.0),
+                                                    egui::Color32::WHITE.gamma_multiply(alpha),
+                                                );
+                                                red_borders.push((rect, alpha));
+                                            }
                                         }
                                         CopyState::Idle => {}
                                     }
@@ -1978,9 +2076,7 @@ impl eframe::App for App {
                                         egui::Color32::BLACK,
                                     );
 
-                                    // Collect Blue border
                                     if self.selected_page == Some(i) {
-                                        blue_border = Some(rect);
                                         if center_selected_after_resize {
                                             ui.scroll_to_rect(rect, Some(egui::Align::Center));
                                         } else if scroll_to_selected {
@@ -1990,34 +2086,24 @@ impl eframe::App for App {
                                 },
                             );
                         }
-                        ui.add_space(row_trailing_space);
                     });
                 }
 
                 // DRAW BORDERS AT THE END (ON TOP OF EVERYTHING)
-                for r in red_borders {
+                for (r, alpha) in red_borders {
                     ui.painter().rect_stroke(
                         r.shrink(2.0),
                         2.0,
-                        egui::Stroke::new(4.0, egui::Color32::RED),
+                        egui::Stroke::new(4.0, egui::Color32::RED.gamma_multiply(alpha)),
                     );
                 }
-                if let Some(r) = blue_border {
+                if let Some((r, alpha)) = blue_border {
                     ui.painter().rect_stroke(
                         r.expand(2.0),
                         2.0,
-                        egui::Stroke::new(3.0, egui::Color32::from_rgb(0, 120, 215)),
-                    );
-                }
-
-                // Draw hover/selection border.
-                if let Some(r) = hover_rect {
-                    ui.painter().rect_stroke(
-                        r.expand(2.0),
-                        1.0,
                         egui::Stroke::new(
-                            2.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 120, 215, 180),
+                            3.0,
+                            egui::Color32::from_rgb(0, 120, 215).gamma_multiply(alpha),
                         ),
                     );
                 }
