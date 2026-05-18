@@ -1772,15 +1772,15 @@ impl eframe::App for App {
             let cell_w = (thumb_f * self.page_aspect).max(20.0);
             let gap = 6.0;
             let cols = ((avail_w + gap) / (cell_w + gap)).floor().max(1.0) as usize;
-            let selected_col = self.selected_page.map(|idx| idx % cols).unwrap_or(0);
-            let selected_center_x = selected_col as f32 * (cell_w + gap) + cell_w * 0.5;
+            let anchor_col = cols / 2;
+            let selected_mod = self.selected_page.map(|idx| idx % cols).unwrap_or(anchor_col);
+            let layout_offset = (anchor_col + cols - selected_mod) % cols;
+            let anchor_center_x = anchor_col as f32 * (cell_w + gap) + cell_w * 0.5;
             let row_content_w = cols as f32 * cell_w + cols.saturating_sub(1) as f32 * gap;
-            // Experimental horizontal-centering mode: position the virtual row so the
-            // selected column starts at the viewport center, instead of anchoring row 1
-            // to the virtual screen's left edge.
-            let row_leading_space = (avail_w * 0.5 - selected_center_x).max(0.0);
-            let row_trailing_space =
-                (selected_center_x + avail_w * 0.5 - row_content_w).max(0.0);
+            // Experimental centered-anchor layout: insert leading virtual slots so the
+            // selected page is placed in the center column after a column-count change.
+            let row_leading_space = (avail_w * 0.5 - anchor_center_x).max(0.0);
+            let row_trailing_space = (anchor_center_x + avail_w * 0.5 - row_content_w).max(0.0);
             let cell_h = thumb_f + 20.0;
 
             // Keyboard navigation
@@ -1846,12 +1846,17 @@ impl eframe::App for App {
                 ui.scroll_with_delta(extra_scroll * 1.2);
 
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for row in 0..n.div_ceil(cols) {
+                for row in 0..(n + layout_offset).div_ceil(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
                         ui.add_space(row_leading_space);
                         for col in 0..cols {
-                            let i = row * cols + col;
+                            let slot = row * cols + col;
+                            if slot < layout_offset {
+                                ui.allocate_space(egui::vec2(cell_w, cell_h));
+                                continue;
+                            }
+                            let i = slot - layout_offset;
                             if i >= n {
                                 break;
                             }
