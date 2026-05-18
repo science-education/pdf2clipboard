@@ -285,12 +285,44 @@ fn is_wasm_render_candidate(pages: &[PageSlot], in_flight: &[usize], i: usize) -
     pages[i].img.is_none() && !in_flight.contains(&i)
 }
 
-fn normalize_thumb_size(size: u32) -> u32 {
-    ((size.clamp(80, 1024)) / 8) * 8
+#[cfg(target_arch = "wasm32")]
+fn get_monitor_height(_ctx: &egui::Context) -> u32 {
+    if let Some(window) = web_sys::window() {
+        if let Ok(screen) = window.screen() {
+            if let Ok(height) = screen.height() {
+                if height > 0 {
+                    return height as u32;
+                }
+            }
+        }
+    }
+    1920
 }
 
-fn normalize_thumb_cache_size(size: u32) -> u32 {
-    ((size.clamp(80, 1024)) / 8) * 8
+#[cfg(not(target_arch = "wasm32"))]
+fn get_monitor_height(ctx: &egui::Context) -> u32 {
+    let mut h = 0;
+    ctx.input(|i| {
+        if let Some(size) = i.viewport().monitor_size {
+            h = size.y.round() as u32;
+        }
+    });
+    if h == 0 {
+        h = ctx.screen_rect().height().round() as u32;
+    }
+    if h > 0 {
+        h
+    } else {
+        1920
+    }
+}
+
+fn normalize_thumb_size(size: u32, max_size: u32) -> u32 {
+    ((size.clamp(80, max_size.max(80))) / 8) * 8
+}
+
+fn normalize_thumb_cache_size(size: u32, max_size: u32) -> u32 {
+    ((size.clamp(80, max_size.max(80))) / 8) * 8
 }
 
 fn toolbar_group(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -557,6 +589,8 @@ impl App {
         let (copy_tx, copy_rx) = mpsc::channel();
         let (download_tx, download_rx) = mpsc::channel();
 
+        let max_height = get_monitor_height(&cc.egui_ctx);
+
         Self {
             pdf_bytes: None,
             copied_page: None,
@@ -565,9 +599,9 @@ impl App {
             pages: Vec::new(),
             thumb_size: 200,
             #[cfg(not(target_arch = "wasm32"))]
-            thumb_cache_size: normalize_thumb_cache_size(desktop_thumb_cache_size()),
+            thumb_cache_size: normalize_thumb_cache_size(desktop_thumb_cache_size(), max_height),
             #[cfg(target_arch = "wasm32")]
-            thumb_cache_size: normalize_thumb_cache_size(get_thumbnail_cache_size_js()),
+            thumb_cache_size: normalize_thumb_cache_size(get_thumbnail_cache_size_js(), max_height),
             thumb_sharpen: 0.0,
             fullscreen: false,
             selection_flash_at: -10.0,
@@ -1746,6 +1780,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            let max_height = get_monitor_height(ctx);
             let mut center_selected_after_resize = false;
             if !self.fullscreen {
                 ui.horizontal_wrapped(|ui| {
@@ -1767,12 +1802,12 @@ impl eframe::App for App {
                     toolbar_group(ui, 292.0, |ui| {
                         ui.label(self.tr.thumbnail);
                         ui.add(
-                            egui::Slider::new(&mut self.thumb_size, 80..=1024u32)
+                            egui::Slider::new(&mut self.thumb_size, 80..=max_height)
                                 .step_by(8.0)
                                 .suffix(" px"),
                         );
                     });
-                    self.thumb_size = normalize_thumb_size(self.thumb_size);
+                    self.thumb_size = normalize_thumb_size(self.thumb_size, max_height);
                     if self.thumb_size != old && self.pdf_bytes.is_some() {
                         center_selected_after_resize = self.selected_page.is_some();
                         // Do NOT clear textures or images! Let egui GPU scale dynamically in real-time.
@@ -1783,13 +1818,13 @@ impl eframe::App for App {
                     toolbar_group(ui, 292.0, |ui| {
                         ui.label(self.tr.thumbnail_source);
                         ui.add(
-                            egui::Slider::new(&mut self.thumb_cache_size, 80..=1024u32)
+                            egui::Slider::new(&mut self.thumb_cache_size, 80..=max_height)
                                 .step_by(8.0)
                                 .suffix(" px")
                                 .show_value(true),
                         );
                     });
-                    self.thumb_cache_size = normalize_thumb_cache_size(self.thumb_cache_size);
+                    self.thumb_cache_size = normalize_thumb_cache_size(self.thumb_cache_size, max_height);
                     if self.thumb_cache_size != old_source {
                         self.rerender_thumbnails();
                     }
@@ -1865,7 +1900,7 @@ impl eframe::App for App {
             if (zoom_delta - 1.0).abs() > 0.01 {
                 let old = self.thumb_size;
                 let scaled = (self.thumb_size as f32 * zoom_delta).round() as u32;
-                self.thumb_size = normalize_thumb_size(scaled);
+                self.thumb_size = normalize_thumb_size(scaled, max_height);
                 if self.thumb_size != old {
                     center_selected_after_resize = self.selected_page.is_some();
                 }
@@ -1945,7 +1980,7 @@ impl eframe::App for App {
             let mut red_borders = Vec::new();
             let mut blue_border = None;
 
-            ScrollArea::both().show(ui, |ui| {
+            ScrollArea::both().animated(false).show(ui, |ui| {
                 // Increase scroll sensitivity (add extra scroll)
                 let extra_scroll = ui.input(|i| i.smooth_scroll_delta);
                 ui.scroll_with_delta(extra_scroll * 1.2);
