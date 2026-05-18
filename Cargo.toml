@@ -7,6 +7,7 @@ edition = "2021"
 name = "PDFPageToClipboard"
 path = "src/main.rs"
 
+
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
@@ -16,6 +17,10 @@ rayon = "1.10"
 sys-locale = "0.3"
 ehttp = "0.5"
 urlencoding = "2.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.61"

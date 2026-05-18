@@ -2157,12 +2157,32 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
+fn load_app_icon() -> Option<std::sync::Arc<egui::IconData>> {
+    let bytes = include_bytes!("../assets/icon.png");
+    if let Ok(image) = image::load_from_memory(bytes) {
+        let rgba = image.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(std::sync::Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("PDF Page to Clipboard")
+        .with_inner_size([960.0, 720.0])
+        .with_drag_and_drop(true);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("PDF Page to Clipboard")
-            .with_inner_size([960.0, 720.0])
-            .with_drag_and_drop(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

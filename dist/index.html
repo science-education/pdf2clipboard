@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDF Page to Clipboard</title>
+    <link rel="icon" href="assets/icon.ico" />
     <style>
         html, body {
             margin: 0;
@@ -19,7 +20,7 @@
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="/pdf2clipboard-b4b44fc9ef24cfc.js" crossorigin="anonymous" integrity="sha384-Q7kxP0fdheV1lD9cRnP38NvGb/O8/ckr4yiHmrFK77gkFT93PuMgqYDkRiAdaNer"><link rel="preload" href="/pdf2clipboard-b4b44fc9ef24cfc_bg.wasm" crossorigin="anonymous" integrity="sha384-ZAFckL7vfBuKOa6ePAm3Wm1hRbxNi0oOK/Wrg0XRSw4yPaLhX+Hef9GBFUT8LbaD" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/pdf2clipboard-d1649be545e2d6a4.js" crossorigin="anonymous" integrity="sha384-njtfqk9tnA+GFPXeX0LDQFI57vPcJSHRNPSLyFy80RsbngzwvQ4mWeA/0fltueo+"><link rel="preload" href="/pdf2clipboard-d1649be545e2d6a4_bg.wasm" crossorigin="anonymous" integrity="sha384-tLZzZxf/f4ty3ZPy38qnIdlxUNe35zPMo1YWZeKfuecJCL+34ffdzGdkX4wiP9lZ" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
     
@@ -239,8 +240,8 @@
     <!-- Trunk will inject the wasm glue script here -->
 
 <script type="module">
-import init, * as bindings from '/pdf2clipboard-b4b44fc9ef24cfc.js';
-const wasm = await init({ module_or_path: '/pdf2clipboard-b4b44fc9ef24cfc_bg.wasm' });
+import init, * as bindings from '/pdf2clipboard-d1649be545e2d6a4.js';
+const wasm = await init({ module_or_path: '/pdf2clipboard-d1649be545e2d6a4_bg.wasm' });
 
 
 window.wasmBindings = bindings;
